@@ -1,0 +1,72 @@
+// SubEtha — shared mailboxes on Cloudflare (named for the sub-etha net: one address,
+// everybody listening). An Email Routing rule per mailbox points at this worker; email()
+// archives the raw message to R2, stores it in the MailboxDO, and fans a copy out to that
+// mailbox's members. The UI behind Access manages mailboxes/members, reads the stored mail,
+// replies AS the mailbox and composes new mail from it.
+//
+// Operator steps, IN THIS ORDER — see README.md. Routing before deploy bounces mail.
+//   1. create the R2 bucket `subetha-mail`
+//   2. `wrangler secret put ADMIN_SECRET`
+//   3. deploy
+//   4. create the Access app over the worker's hostname, paste its AUD into ACCESS_AUD,
+//      deploy again  (until then the UI refuses EVERYONE — see access.js, change 3)
+//   5. only now point the Email Routing rules at the worker
+{
+  "name": "subetha",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "preview_urls": false,
+  // workers_dev is left at the default: this worker has a UI and the Access app needs a
+  // hostname to sit over. The worker verifies the Access JWT itself and every route — with
+  // no exception, not even a health check — returns 401 without one, so the workers.dev
+  // name being resolvable is not an open door.
+  "observability": { "enabled": true },
+
+  "durable_objects": {
+    "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MailboxDO"] }],
+
+  // The raw .eml of every message, in and out: <mailbox>/<YYYY>/<MM>/<message-id>.eml.
+  // Written BEFORE anything is parsed, so a parser bug costs a body and never the original.
+  "r2_buckets": [{ "binding": "MAIL", "bucket_name": "subetha-mail" }],
+
+  // DELIBERATELY UNRESTRICTED — no allowed_destination_addresses.
+  //
+  // A worker that only ever mails its own operator can lock its send_email binding to a
+  // fixed sink list. SubEtha cannot: replying to a shared mailbox means replying to whoever
+  // wrote in, and that is an address nobody can enumerate in advance. So the binding is
+  // unrestricted and the wall is placed in the CODE instead:
+  //
+  //   * compose.js is the only module that sends to a caller-chosen address, and it is
+  //     reachable ONLY from POST /api/messages/:id/reply and POST /api/mailboxes/:a/send,
+  //     both behind the auth check that runs before any routing decision in index.js.
+  //   * inbound.js — the whole email() path — does NOT import compose.js, and therefore
+  //     cannot reach it. test/structure.test.mjs asserts that on every run.
+  //   * the fan-out in inbound.js does send, but only to an address the OWNER put on the
+  //     member list, never to one that arrived in the message.
+  //
+  // If that wall is ever breached, this binding turns a spam run into a spam run FROM your
+  // own domain — the same domain and the same account-wide sending quota everything else
+  // you send rides on. Any change to inbound.js's imports is a change to this binding's
+  // blast radius.
+  "send_email": [{ "name": "SEND" }],
+
+  "vars": {
+    // Replace after step 4. The placeholder matches no JWT, which is the point: with it in
+    // place the worker is closed, and it is closed in the direction that costs a login
+    // rather than the direction that costs the mailboxes.
+    "ACCESS_AUD": "TBD-set-after-access-app-created",
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    // Domains whose addresses THIS worker routes. A member on one of them would be handed
+    // straight back to email() by Email Routing — Cloudflare short-circuits mail addressed
+    // to a domain it routes, sub-second rather than a normal internet hop — so the fan-out
+    // skips them. Add a domain here the same day its routing starts pointing at SubEtha.
+    "ROUTED_DOMAINS": "example.com"
+  }
+
+  // Secret, set by hand and never in this file:
+  //   ADMIN_SECRET — bearer for the /api/* routes (automation path). `wrangler secret put
+  //                  ADMIN_SECRET`, pasted at the prompt. An UNSET secret authenticates
+  //                  nothing: index.js guards on !!env.ADMIN_SECRET before comparing.
+}
