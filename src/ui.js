@@ -83,6 +83,20 @@ function when(ms, dateHdr) {
   if (dateHdr) return dateHdr.replace(/\\s*\\([^)]*\\)\\s*$/, "");
   return ms ? new Date(ms).toISOString().slice(0, 16).replace("T", " ") + "Z" : "";
 }
+// Coarse on purpose: a member row is answering "is this still happening", not "when exactly".
+// A clock ahead of the server's would give a negative age, which reads as nonsense — clamp.
+function rel(ms) {
+  var n = Number(ms) || 0;
+  if (!n) return "";
+  var s = Math.round((Date.now() - n) / 1000);
+  if (s < 0) s = 0;
+  if (s < 90) return "just now";
+  var m = Math.round(s / 60);
+  if (m < 60) return m + "m ago";
+  var h = Math.round(m / 60);
+  if (h < 48) return h + "h ago";
+  return Math.round(h / 24) + "d ago";
+}
 async function api(path, opts) {
   var o = opts || {};
   o.credentials = "include";
@@ -107,20 +121,43 @@ var CSP_BLOCKED = ${JSON.stringify(CSP("data:"))};
 var CSP_REMOTE = ${JSON.stringify(CSP("data: https:"))};
 
 // ---- mailbox configuration --------------------------------------------
-function memberRow(email, mode) {
+// What the last fan-out to this member did. A forward to an address that is not a verified
+// destination throws on EVERY message, the other members still get theirs, and the failure
+// is otherwise only visible by opening a message and reading its fan-out table — so it is
+// said here, on the row that can be fixed. Nothing at all for a member nothing has been sent
+// to yet: an absent status is not a failure.
+function memberStat(last) {
+  if (!last) return "";
+  var t = last.error ? ' title="' + esc(last.error) + '"' : "";
+  if (!last.ok) return '<span class="mstat bad"' + t + ">&#9888; " + esc(last.hint || last.error || "delivery failed") + "</span>";
+  // ok with mode 'skip' is the loop guard or a member skip: nothing was sent, and saying
+  // "delivered" about a message that was deliberately not sent is the one lie to avoid here.
+  if (last.mode === "skip") return '<span class="mstat"' + t + ">&middot; skipped " + esc(rel(last.at)) + "</span>";
+  return '<span class="mstat ok">&#10003; delivered ' + esc(rel(last.at)) + "</span>";
+}
+function memberTint(last) {
+  if (!last) return "";
+  if (!last.ok) return "m-bad";
+  return last.mode === "skip" ? "m-skip" : "m-ok";
+}
+function memberRow(email, mode, last) {
   if (!isOwner) {
     var ro = document.createElement("tr");
-    ro.innerHTML = "<td>" + esc(email || "") + '</td><td class="note">' + esc(mode || "") + "</td><td></td>";
+    ro.className = memberTint(last);
+    ro.innerHTML = "<td>" + esc(email || "") + '</td><td class="note">' + esc(mode || "") + "</td><td>" +
+      memberStat(last) + "</td><td></td>";
     return ro;
   }
   // The two radios must share a name to be mutually exclusive, and that name must be unique
   // to the row or every row in the table becomes one radio group.
   var nm = "mode" + Math.random().toString(36).slice(2);
   var tr = document.createElement("tr");
+  tr.className = memberTint(last);
   tr.innerHTML =
     '<td><input type="email" class="m-email" style="width:260px" value="' + esc(email || "") + '" placeholder="someone@example.com"></td>' +
     '<td><label><input type="radio" class="m-fwd" name="' + nm + '"' + (mode !== "send" ? " checked" : "") + '> forward</label> ' +
     '<label><input type="radio" class="m-snd" name="' + nm + '"' + (mode === "send" ? " checked" : "") + '> send</label></td>' +
+    "<td>" + memberStat(last) + "</td>" +
     '<td><button class="link m-del">remove</button></td>';
   tr.querySelector(".m-del").onclick = function () { tr.remove(); };
   return tr;
@@ -141,7 +178,7 @@ function showConfig(b) {
   el("dn").value = (b && b.display_name) || "";
   var tb = el("members"); tb.innerHTML = "";
   var ms = (b && b.members) || [];
-  for (var i = 0; i < ms.length; i++) tb.appendChild(memberRow(ms[i].email, ms[i].mode));
+  for (var i = 0; i < ms.length; i++) tb.appendChild(memberRow(ms[i].email, ms[i].mode, ms[i].last));
   if (!ms.length && isOwner) tb.appendChild(memberRow("", "forward"));
 }
 // A member sees the configuration and cannot change it: the editor's controls are removed
@@ -179,10 +216,13 @@ async function loadBoxes(keep) {
 }
 
 // ---- message list ------------------------------------------------------
+// An outbound row's fan-out rows are its envelope recipients, not a fan-out to members —
+// "fan-out 2/2" on something this mailbox sent reads as if the reply went to the member list.
 function fanoutCell(m) {
   if (!m.fanout_total) return "";
   var bad = m.fanout_total - m.fanout_ok;
-  return '<span class="badge' + (bad ? " bad" : "") + '">fan-out ' + m.fanout_ok + "/" + m.fanout_total + "</span>";
+  var label = m.direction === "out" ? "sent " : "fan-out ";
+  return '<span class="badge' + (bad ? " bad" : "") + '">' + label + m.fanout_ok + "/" + m.fanout_total + "</span>";
 }
 function renderList() {
   var only = el("onlyunconf").checked;

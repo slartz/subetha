@@ -12,7 +12,7 @@
 // sender has been told the address is broken.
 import { bytesToLatin1, decodeWords } from "./mime.js";
 import { parseBody } from "./parse-mail.js";
-import { buildMime, addrOf, headerValue } from "./build-mime.js";
+import { buildMime, addrOf, headerValue, viaName, viaLine, viaHtml } from "./build-mime.js";
 import { loopReason, memberSkip, parseDomains } from "./loop-guard.js";
 import { sendRaw } from "./send.js";
 import { r2Key, archive } from "./archive.js";
@@ -102,6 +102,13 @@ export async function handleInbound(message, env, ctx) {
     results.push({ member: null, mode: "skip", ok: true, error: `loop guard: ${suppressed} — fan-out suppressed` });
   } else {
     const routed = parseDomains(env.ROUTED_DOMAINS);
+    // Who wrote it, for the send-mode copies only. A send-mode copy arrives FROM the mailbox
+    // — it has to, for DMARC — so without these three the sender is invisible in a reading
+    // pane and every message in the thread looks like it came from the mailbox itself.
+    // Forward mode is untouched: Cloudflare preserves the original there.
+    const viaOpts = { from: fromHdr || row.from_addr, mailbox };
+    const viaFrom = viaName({ name: row.from_name, addr: row.from_addr, via: stored.display_name || mailbox.split("@")[0] });
+    const viaBody = viaLine(viaOpts);
     for (const m of stored.members) {
       const skip = memberSkip(m.email, mailbox, routed);
       if (skip) { results.push({ member: m.email, mode: "skip", ok: true, error: `skipped: ${skip}` }); continue; }
@@ -114,12 +121,12 @@ export async function handleInbound(message, env, ctx) {
         } else {
           await sendRaw(env, mailbox, m.email, buildMime({
             from: mailbox,
-            fromName: stored.display_name || mailbox.split("@")[0],
+            fromName: viaFrom,
             to: m.email,
             replyTo: addrOf(fromHdr) || undefined,
             subject: row.subject || "",
-            text: row.text || "",
-            html: row.html || null,
+            text: `${viaBody}\n\n${row.text || ""}`,
+            html: row.html ? viaHtml(viaOpts) + row.html : null,
             headers: {
               "X-Subetha-Hop": "1",
               "X-Subetha-Original-From": fromHdr,

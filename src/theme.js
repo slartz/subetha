@@ -178,6 +178,16 @@ iframe.html { width: 100%; height: 460px; border: 1px solid var(--hair); border-
 
 .members { width: 100%; border-collapse: collapse; }
 .members td { padding: 2px 4px; }
+/* The left edge of a member row is its last delivery: green delivered, red failed, grey
+   deliberately skipped — and transparent, not absent, for a member nothing has been sent to
+   yet, so no row shifts sideways when one of them gains a status. */
+.members tr > td:first-child { border-left: 3px solid transparent; padding-left: var(--s2); }
+.members tr.m-ok   > td:first-child { border-left-color: var(--a); }
+.members tr.m-bad  > td:first-child { border-left-color: #b00; }
+.members tr.m-skip > td:first-child { border-left-color: var(--i); }
+.mstat { font-size: 11px; color: var(--lo); display: inline-block; max-width: 460px; }
+.mstat.ok  { color: var(--a); }
+.mstat.bad { color: #b00; }
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex;
          align-items: flex-start; justify-content: center; padding: 6vh var(--s4); z-index: 9; }
 .modal .card { background: var(--panel); border-radius: var(--r); box-shadow: var(--shadow-lg);

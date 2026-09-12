@@ -194,3 +194,51 @@ export function quote(text, opts = {}) {
   const lines = String(text ?? "").replace(/\r\n|\r/g, "\n").split("\n");
   return `${attribution(opts)}\n${lines.map((l) => `> ${l}`).join("\n")}`;
 }
+
+// ---- the send-mode copy's sender ------------------------------------------
+//
+// A forwarded copy keeps the original From; Cloudflare rewrites the envelope and the reader
+// still sees who wrote. A send-mode copy cannot: it is a new message from the mailbox, and
+// the From ADDRESS has to stay the mailbox's or the domain's DMARC alignment goes with it.
+// So the sender is said where a reading pane actually shows it — in the display name, and in
+// one line at the top of the body. Reply-To still carries the real address, which is what
+// makes "Reply" do the right thing; a header nobody's client displays does not.
+
+// A display name is a string a stranger chose, and a From line that is mostly it is a From
+// line nobody can read. The mailbox's own half is never truncated.
+const VIA_NAME_MAX = 120;
+
+// "Alice via Support" — the name only; the address alongside it stays the mailbox's. The
+// sender's own name when the message carried one, the local part of their address when it did
+// not, and the mailbox's name alone when there is nothing to say about the sender at all,
+// which is exactly what this line used to be. CRLF goes in headerValue; a non-ASCII result
+// becomes an encoded word in addressWithName, which is where every other display name is
+// encoded too.
+export function viaName({ name, addr, via } = {}) {
+  const bare = addrOf(addr);
+  const who = headerValue(name) || (bare ? bare.split("@")[0] : "");
+  const box = headerValue(via);
+  if (!who) return box;
+  if (!box) return who.slice(0, VIA_NAME_MAX);
+  return `${who.slice(0, VIA_NAME_MAX)} via ${box}`;
+}
+
+// The line at the top of the body: who wrote it, and which mailbox it came through. Its own
+// function because the text alternative and the html one must say the same sentence, and two
+// copies of a sentence are two sentences waiting to disagree.
+export function viaLine({ from, mailbox } = {}) {
+  const who = headerValue(from) || "unknown sender";
+  const box = headerValue(mailbox);
+  return box ? `From: ${who} — via ${box}` : `From: ${who}`;
+}
+
+// The line carries a From header a stranger wrote, so it is escaped before it goes anywhere
+// near markup: it is text, and it has to arrive as text.
+const escHtml = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// The same line as a muted div, to sit ABOVE the original html rather than inside it: the
+// sender's own markup is left exactly as it was, so the message still looks like itself, and
+// the line reads as this worker's rather than as something the sender wrote.
+export const viaHtml = (opts) =>
+  `<div style="color:#6b7280;font-size:12px;margin:0 0 12px">${escHtml(viaLine(opts))}</div>`;

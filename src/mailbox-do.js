@@ -10,6 +10,7 @@
 //
 // RPC surface only — no fetch() handler on the object; callers invoke its methods directly.
 import { DurableObject } from "cloudflare:workers";
+import { withMemberStatus } from "./fanout-status.js";
 
 const now = () => Date.now();
 
@@ -68,7 +69,35 @@ export class MailboxDO extends DurableObject {
       ORDER BY a.address`)
       // The editor needs the member list, not just its size, and a shared mailbox has a
       // handful of them — cheaper than a second round trip per mailbox from the browser.
-      .map((r) => ({ ...r, members: this.#rows("SELECT email, mode FROM members WHERE mailbox=? ORDER BY email", r.address) }));
+      // Same for each member's last delivery: a forward to an address that is not a verified
+      // destination fails on every message, quietly, and the member row is where that belongs.
+      .map((r) => withMemberStatus({
+        ...r,
+        members: this.#rows("SELECT email, mode FROM members WHERE mailbox=? ORDER BY email", r.address),
+        member_status: this.memberStatus(r.address),
+      }));
+  }
+
+  // The latest fan-out attempt per member of this mailbox. Read-only, and no new table: the
+  // rows are already in fanout_log, and "what happened to this member last time" is the one
+  // thing a member row cannot say without asking.
+  //
+  // Scoped through messages, because fanout_log has no mailbox column of its own: without the
+  // join a member who is on two mailboxes would be shown the other mailbox's result on both.
+  // Latest is by id, not by `at` — one recordFanout() call stamps every row in the batch with
+  // the same millisecond. A member with no attempt yet comes back with the columns NULL.
+  memberStatus(mailbox) {
+    return this.#rows(`
+      SELECT mb.email AS email, f.mode AS mode, f.ok AS ok, f.error AS error,
+             f.at AS at, f.message_row AS message_row
+      FROM members mb
+      LEFT JOIN fanout_log f ON f.id = (
+        SELECT f2.id FROM fanout_log f2
+        JOIN messages ms ON ms.id = f2.message_row
+        WHERE f2.member = mb.email AND ms.mailbox = mb.mailbox
+        ORDER BY f2.id DESC LIMIT 1)
+      WHERE mb.mailbox = ?
+      ORDER BY mb.email`, mailbox);
   }
 
   // Members are REPLACED, not merged: the editor posts the whole list, so a row missing
@@ -82,7 +111,10 @@ export class MailboxDO extends DurableObject {
     for (const m of members || [])
       this.sql.exec("INSERT OR REPLACE INTO members(mailbox,email,mode,added_at) VALUES(?,?,?,?)",
         address, m.email, m.mode, now());
-    return this.config(address);
+    // The same shape the list returns, status and all: the editor redraws its rows from this
+    // response, and a member whose last delivery failed must not lose that on a save. config()
+    // itself stays lean — mayView() and compose.js ask it on every read and neither needs it.
+    return withMemberStatus({ ...this.config(address), member_status: this.memberStatus(address) });
   }
 
   // Messages are KEPT. They are the mailbox's history and deleting the configuration is an
