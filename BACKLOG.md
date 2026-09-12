@@ -4,8 +4,8 @@
 - [x] Bucket, secret, deploy, Access application, AUD set, redeploy. Both hostnames verified: **401** before the Access app, **302 to the team login** after.
 - [x] First mailbox configured, routing repointed, real mail stored + forwarded, reply from the UI delivered; three members (two forward, one send) all `ok`.
 - [x] HTML by default; inline `cid:` images; HTML quotes in replies; owners/members; per-member delivery status; send-mode sender attribution; Rules v1 (mute). 128 tests. First schema migration verified on live data.
-- [ ] In progress (2026-09-13): `GET /api/health` for external monitoring; loop-guard superset + `Auto-Submitted` stamp on send copies; `GET /api/export` + daily config snapshot to R2; per-mailbox storage counter, one-shot "delete older than N days", standing `retention_days` applied by the daily cron.
-- [ ] Queued behind it (same files): a design pass — "pleasing, comfortable, fine", not a redesign — and an inline-SVG favicon (envelope with a forward arrow, legible at 16px).
+- [x] `GET /api/health` (watched by the operator's monitor); `GET /api/export` + daily `_config/` snapshot to R2; storage counter, one-shot purge with dry-run, standing `retention_days`; loop-guard corrections. 159 tests. Live 2026-09-13.
+- [ ] In progress: design pass — "pleasing, comfortable, fine", not a redesign — and an inline-SVG favicon (envelope with a forward arrow, legible at 16px).
 - [ ] Publish decision: flip the GitHub repo public once the README reads right; keep Issues/PRs enabled.
 - [ ] Operators embedding this in a private infrastructure repo: keep your real `wrangler` config **outside** the copy/subtree so upstream merges never conflict on vars.
 
