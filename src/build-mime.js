@@ -179,12 +179,18 @@ export const reSubject = (s) => {
   return /^re\s*:/i.test(v) ? v : `Re: ${v}`.trim();
 };
 
-// The attribution line and the quoted original, as every mail client has written it since
-// 1995. Quoting an already-quoted line just deepens it, which is correct.
-export function quote(text, { date, from } = {}) {
-  const lines = String(text ?? "").replace(/\r\n|\r/g, "\n").split("\n");
+// "On <date>, <who> wrote:", as every mail client has written it since 1995. Its own function
+// because the text alternative of a reply and the html one must say the same sentence, and
+// two copies of a sentence are two sentences waiting to disagree.
+export function attribution({ date, from } = {}) {
   const who = headerValue(from) || "someone";
   const when = headerValue(date);
-  const attribution = when ? `On ${when}, ${who} wrote:` : `${who} wrote:`;
-  return `${attribution}\n${lines.map((l) => `> ${l}`).join("\n")}`;
+  return when ? `On ${when}, ${who} wrote:` : `${who} wrote:`;
+}
+
+// The attribution line and the quoted original. Quoting an already-quoted line just deepens
+// it, which is correct.
+export function quote(text, opts = {}) {
+  const lines = String(text ?? "").replace(/\r\n|\r/g, "\n").split("\n");
+  return `${attribution(opts)}\n${lines.map((l) => `> ${l}`).join("\n")}`;
 }

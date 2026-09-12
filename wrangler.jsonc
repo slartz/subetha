@@ -58,6 +58,16 @@
     // rather than the direction that costs the mailboxes.
     "ACCESS_AUD": "TBD-set-after-access-app-created",
     "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    // Who may configure mailboxes, comma separated, compared against the Access JWT's email
+    // claim in lowercase. An owner sees every mailbox and may create, edit and delete them;
+    // anybody else sees only the mailboxes their own address is on the member list of, and
+    // may read, reply and compose from those. Someone who is neither gets 403 from every
+    // route that names a mailbox. The ADMIN_SECRET bearer is owner-equivalent.
+    //
+    // SET THIS. The placeholder is nobody: with it in place, and Access admitting a person
+    // who is on no member list, the UI opens on an empty mailbox list and nothing can be
+    // configured — closed in the direction that costs an edit to this file.
+    "OWNERS": "owner@example.com",
     // Domains whose addresses THIS worker routes. A member on one of them would be handed
     // straight back to email() by Email Routing — Cloudflare short-circuits mail addressed
     // to a domain it routes, sub-second rather than a normal internet hop — so the fan-out

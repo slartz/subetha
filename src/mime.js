@@ -1,6 +1,10 @@
-// Adapted from an earlier worker by the same author; see LICENSE. Verbatim below this
-// banner: SubEtha has no build step and no shared package, so the file is copied rather
-// than imported. A bug fixed here wants the same fix in the original.
+// Adapted from an earlier worker by the same author; see LICENSE. Copied rather than
+// imported: SubEtha has no build step and no shared package. A bug fixed here wants the same
+// fix in the original.
+//
+// ONE deliberate change from that original, marked CHANGED at the function: stripHtml()
+// renders a link as "text (url)" and drops images entirely. SubEtha quotes its output back to
+// a stranger inside a reply, which the original never did.
 //
 // The anchored header regexes and the boundary-aware splitting are the load-bearing
 // properties — see the comment on hdr() for the fortnight of DMARC reports that was lost
@@ -131,12 +135,37 @@ export function parseParts(raw) {
 export const decodeBody = (p) =>
   p.cte === "base64" ? b64ToBytes(p.body) : latin1ToBytes(p.cte === "quoted-printable" ? qpDecode(p.body) : p.body);
 
+// CHANGED from the original: what a link and an image become. There is ONE text derivation in
+// SubEtha and it has two readers — the stored text of an html-only message, and the quoted
+// original inside a plain-text reply — so what it does to a marketing signature is not a
+// cosmetic question. A link keeps its target ("text (url)"), because a reader of the quote
+// cannot hover. An image contributes NOTHING: an alt attribute in a signature is
+// "image001.png" and a data: src is a screenful of base64, and both are noise in a reply.
+const linkText = (attrs, inner) => {
+  const raw = /\bhref\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/i.exec(attrs)?.[1] || "";
+  const href = (/^["']/.test(raw) ? raw.slice(1, -1) : raw).trim();
+  const text = inner.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  // An anchor, a cid: or a script URL has nothing a reader could act on.
+  if (!href || /^(?:#|cid:|data:|javascript:|vbscript:)/i.test(href)) return text;
+  const bare = href.replace(/^mailto:/i, "");
+  if (!text) return bare;
+  const same = (a, b) => a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
+  return same(text, href) || same(text, bare) ? text : `${text} (${bare})`;
+};
+
 export const stripHtml = (h) =>
-  h.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ")
-   .replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")
+  String(h ?? "")
+   .replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ")
+   .replace(/<img\b[^>]*>/gi, "")
+   .replace(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a\s*>/gi, (_, attrs, inner) => linkText(attrs, inner))
+   .replace(/<br\s*\/?>/gi, "\n")
+   // Closing tags only, as the original had it. Mapping the OPENING tag as well puts a blank
+   // line between every pair of blocks, and Gmail wraps each individual LINE in a div — the
+   // quote would come back to the sender at twice its length.
+   .replace(/<\/(p|div|tr|li|h[1-6]|table|blockquote|ul|ol)\s*>/gi, "\n")
    .replace(/<[^>]+>/g, " ")
    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(+d))
-   .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+   .replace(/[ \t]+/g, " ").replace(/[ \t]*\n[ \t]*/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 
 export const ATTACH = /^(application\/(pdf|zip|octet-stream|vnd\.|msword)|image\/)/i;

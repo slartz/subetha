@@ -20,7 +20,12 @@ in one sentence, and every control below exists because of it.
 | Path traversal or key collision via a hostile Message-ID | `archive.js` `keySafe()` — angle brackets stripped, everything outside `[A-Za-z0-9@._+-]` replaced with `_`. |
 | A mail loop burning the sending quota | Two independent guards (`loop-guard.js`), plus a refusal to reply to the mailbox's own address. |
 | A bounce storm damaging the account's sending reputation | `email()` never throws and never calls `setReject`. Asserted. |
-| Hostile HTML in a stored message running in the operator's browser | The reader renders HTML in an iframe with an **empty** `sandbox` attribute: no scripts, no same-origin, no forms, no navigation. |
+| Hostile HTML in a stored message running in the operator's browser | Three layers: an iframe with an **empty** `sandbox` attribute (no scripts, no same-origin, no forms, no navigation); a CSP meta at the top of the srcdoc (`default-src 'none'`); and a server-side sanitiser that strips `<script>`, `on*=`, `<iframe>`, `<object>`, `<embed>`, `<form>`, `<base>`, `<meta http-equiv>` and `javascript:`/`vbscript:` URLs. |
+| Hostile HTML reaching a **recipient's** mail client inside a reply quote | The same sanitiser, plus `<style>` blocks dropped (document-wide CSS from the original would restyle the reply written above it) and `cid:` images removed. There is no sandbox out there — the recipient's client is the renderer — which is why the sanitiser exists at all rather than being left to the iframe. |
+| A remote image in mail acting as a read receipt | Every `http(s)` `<img src>` is rewritten to `data-remote-src` with a transparent placeholder before the row leaves the worker, and the CSP is `img-src data:`. Loading them is one explicit click, per message, and reopening the message blocks them again. |
+| A `cid:` image tempting someone to add a fetch route for MIME parts | Parts are inlined as `data:` URIs server-side instead. The sandboxed iframe has an **opaque origin**, so a subresource request from it would not carry the `CF_Authorization` cookie and would 401 — such a route would have to weaken the sandbox to work. |
+| A huge inline image turning one message read into a memory event | 2 MB per image and 6 MB per message. Over either cap the `src` is left as the unresolved `cid:`; over the 20 MB parse cap the archive is not read at all. |
+| One mailbox's member reading another mailbox | `perm.js`, enforced server-side on every route. See *Owners and members*. |
 | A third-party script or font on the admin page | The UI loads **no external resource of any kind**. Everything is inline. |
 | Memory exhaustion from a huge message | Over 20 MB the raw message is streamed straight to R2 and never held in the isolate; the body is not parsed. |
 
@@ -43,6 +48,40 @@ Because the binding cannot be constrained, the constraint is structural:
 
 **Any change to `inbound.js`'s imports is a change to this binding's blast radius.** Review
 such a change as a security change.
+
+## Owners and members
+
+Authentication answers *whether*. `perm.js` answers *who*, immediately below the auth gate and
+before any route runs.
+
+* **Owner** — an address in the `OWNERS` var, or the `ADMIN_SECRET` bearer. Sees every mailbox;
+  creates, edits and deletes them.
+* **Member** — an address on some mailbox's member list, in either mode. Sees **that** mailbox:
+  reads it, downloads its raw `.eml`, replies and composes from it. May not change any
+  configuration and may not see a mailbox it is not on.
+* **Neither** — 403 from every route that names a mailbox or a message. `GET /`,
+  `GET /api/me` and `GET /api/mailboxes` still answer, with an empty list, so a mistyped
+  bookmark gets "you are on no mailbox" rather than a bare error.
+
+Three things about this are load-bearing:
+
+1. **It is enforced on the server, on every route.** The UI hides what a member cannot use, and
+   that is presentation only — a hidden button is not a permission. `test/structure.test.mjs`
+   asserts that every mutating mailbox route calls the admin check and that every route naming a
+   mailbox or a message calls the view check.
+2. **Comparison is lowercase and otherwise literal.** Gmail dots and `+tags` are deliberately
+   **not** normalised: two different strings are two different identities, and an
+   address-equivalence rule that is right for one provider is wrong for the next. Being wrong
+   here hands over a mailbox.
+3. **An unconfigured mailbox has no members, so only an owner sees it.** Mail that arrived at an
+   address nobody has claimed is the operator's problem, not a stranger's.
+
+A member is trusted with the `send_email` binding for their own mailbox: they can reply and
+compose as it, to anyone. That is the point of a shared mailbox, and it is why the member list is
+an owner-only field. **Adding a member is granting the right to send as that address.**
+
+`OWNERS` unset or left at the shipped `owner@example.com` placeholder means nobody is an owner
+and nothing can be configured — closed in the direction that costs an edit to `wrangler.jsonc`.
 
 ## Authentication
 
@@ -74,9 +113,9 @@ worker will then refuse everyone.
 
 ### What an attacker with the bearer token can do
 
-Everything the UI can, without a browser: read every stored message and every archived `.eml`,
-rewrite member lists, delete mailbox configurations, and **send mail from any configured
-mailbox to any address**. It is a credential of the same weight as control of the domain.
+Everything an owner can, without a browser — the bearer is owner-equivalent by design: read
+every stored message and every archived `.eml`, rewrite member lists, delete mailbox
+configurations, and **send mail from any configured mailbox to any address**. It is a credential of the same weight as control of the domain.
 Rotate it with `wrangler secret put ADMIN_SECRET`, keep it out of browsers, source, CI logs and
 shell history, and store it in a secret manager rather than a file.
 
@@ -89,6 +128,7 @@ The worker logs in JSON to `console`, which means Workers Logs / tail. What it l
 * **Failures**: the stage (`read`, `decode`, `parse`, `fanout_log`, `archive_failed`), the
   mailbox, the R2 key, and a truncated error string.
 * **Fetch errors**: the pathname and a truncated error string.
+* **Render failures**: the message row id and a truncated error string — never any of the HTML.
 * **Envelope addresses** on an inbound failure (`to`, `from`), truncated to 200 characters.
 
 What must **never** be logged, and is not:

@@ -92,3 +92,78 @@ test("every route in index.js sits behind the auth check", () => {
 test("an unset ADMIN_SECRET cannot authenticate anything", () => {
   assert.match(code("index.js"), /if \(!env\.ADMIN_SECRET\) return false;/);
 });
+
+// ---- the permission model, asserted -------------------------------------
+//
+// canView/canAdmin are exercised directly in test/perm.test.mjs. What that cannot see is
+// whether the ROUTES ask them. A predicate nobody calls is a permission model in the comments,
+// so these read index.js and check that every route which names a mailbox or a message asks
+// before it answers.
+
+const between = (s, from, to) => {
+  const i = s.indexOf(from);
+  assert.ok(i >= 0, `marker not found: ${from}`);
+  const j = s.indexOf(to, i);
+  assert.ok(j > i, `${to} does not follow ${from}`);
+  return s.slice(i, j);
+};
+const count = (s, needle) => s.split(needle).length - 1;
+
+test("every mutating mailbox route checks the admin permission before it mutates", () => {
+  const s = code("index.js");
+  for (const [route, mutate] of [
+    ['seg.length === 3 && request.method === "PUT"', "stub.upsertMailbox("],
+    ['seg.length === 3 && request.method === "DELETE"', "stub.deleteMailbox("],
+  ]) {
+    assert.equal(count(s, mutate), 1, `${mutate} must have exactly one call site to guard`);
+    assert.match(between(s, route, mutate), /canAdmin\(identity, owners\)/,
+      `${mutate} is reachable without the admin check — a member could rewrite a member list`);
+  }
+});
+
+test("every mailbox route that is not mutating checks the view permission", () => {
+  const s = code("index.js");
+  for (const [route, act] of [
+    ['seg[3] === "messages" && request.method === "GET"', "stub.messages("],
+    ['seg[3] === "send" && request.method === "POST"', "composeNew(env, stub, address"],
+  ]) assert.match(between(s, route, act), /mayView\(stub, identity, owners, address\)/,
+    `${act} is reachable without the view check`);
+});
+
+test("the message routes resolve the row and ask about ITS mailbox before answering", () => {
+  const s = code("index.js");
+  const guard = s.indexOf("mayView(stub, identity, owners, m.mailbox)");
+  assert.ok(guard > 0, "the messages branch must ask about the mailbox the message belongs to");
+  for (const answered of [
+    "await withRenderedHtml(env, m)",
+    "await env.MAIL.get(m.r2_key)",
+    "await replyToMessage(env, stub, id, body, identity)",
+  ]) assert.ok(s.indexOf(answered) > guard, `${answered} is reached before the check`);
+});
+
+test("the mailbox list is filtered by identity, never handed over whole", () => {
+  const s = code("index.js");
+  assert.match(s, /json\(visibleMailboxes\(await stub\.mailboxes\(\), identity, owners\)\)/);
+  assert.equal(/json\(await stub\.mailboxes\(\)\)/.test(s), false,
+    "the unfiltered list would tell a stranger every address in the zone");
+});
+
+test("a reply carries an html alternative only when the original had one", () => {
+  const s = code("compose.js");
+  assert.match(s, /html: msg\.html \? quoteHtml\(/,
+    "a text-only original must be answered in text/plain, as it always was");
+  const composeNew = s.slice(s.indexOf("export async function composeNew"));
+  assert.equal(/quoteHtml|html:/.test(composeNew), false, "compose (new mail) stays text/plain");
+  assert.deepEqual(files.filter((f) => /\bbuildMime\(\{/.test(code(f))).sort(), ["compose.js", "inbound.js"],
+    "one builder, two callers — the html alternative reuses it rather than adding a second");
+});
+
+test("the reader never shows a message without the empty sandbox and the CSP", () => {
+  const s = code("ui.js");
+  assert.match(s, /f\.setAttribute\("sandbox", ""\)/, "the empty sandbox is the first layer");
+  assert.match(s, /f\.srcdoc = "<!doctype html>" \+ \(loadRemote \? CSP_REMOTE \+ withRemote\(doc\) : CSP_BLOCKED \+ doc\)/,
+    "the CSP goes at the top of the document, every time, in both branches");
+  assert.equal(/srcdoc = m\.html/.test(s), false, "the stored html must never go in unrendered");
+  assert.equal(count(s, "loadRemote = true"), 1,
+    "exactly one thing may load a remote image, and it is the operator's click");
+});

@@ -17,14 +17,17 @@
 // THE WALL: inbound.js does not import compose.js, so the "send to an address of the
 // caller's choosing" capability is not reachable from email(). test/structure.test.mjs
 // asserts it on every run.
-import { handleInbound } from "./inbound.js";
+import { handleInbound, RAW_PARSE_MAX } from "./inbound.js";
 import { replyToMessage, composeNew, HttpError } from "./compose.js";
 import { accessOk, accessEmail } from "./access.js";
 import { validAddr } from "./build-mime.js";
+import { canAdmin, canView, parseOwners, visibleMailboxes } from "./perm.js";
+import { inlineParts, renderHtml } from "./html-render.js";
 import { renderUi } from "./ui.js";
 export { MailboxDO } from "./mailbox-do.js";
 
 const json = (o, status = 200) => Response.json(o, { status });
+const forbidden = () => json({ error: "forbidden" }, 403);
 const MODES = new Set(["forward", "send"]);
 
 // Constant-time, and length-blind: both sides are hashed first, so the comparison is always
@@ -86,6 +89,11 @@ export async function route(request, env, ctx) {
   else if (await accessOk(request, env)) identity = accessEmail(request) || "access";
   if (!identity) return json({ error: "unauthorized" }, 401);
 
+  // WHO, not just whether. An owner sees every mailbox and may configure them; a member sees
+  // only the mailboxes their address is on; anyone else gets 403 from every route that names
+  // one. The shell at GET / still renders — see perm.js for why.
+  const owners = parseOwners(env.OWNERS);
+  const admin = canAdmin(identity, owners);
   const stub = env.MAILBOX.get(env.MAILBOX.idFromName("subetha"));
   const seg = path.split("/").filter(Boolean).map(decodeURIComponent);
 
@@ -93,12 +101,18 @@ export async function route(request, env, ctx) {
     return new Response(renderUi({ identity }), { headers: { "content-type": "text/html; charset=utf-8" } });
   }
 
+  // The UI asks this once, to decide whether to draw the editor at all. The SERVER decides
+  // whether to honour what the editor posts; this is only what the page is told.
+  if (path === "/api/me" && request.method === "GET") return json({ identity, is_owner: admin });
+
   // /api/mailboxes …
   if (seg[0] === "api" && seg[1] === "mailboxes") {
-    if (seg.length === 2 && request.method === "GET") return json(await stub.mailboxes());
+    if (seg.length === 2 && request.method === "GET")
+      return json(visibleMailboxes(await stub.mailboxes(), identity, owners));
 
     const address = String(seg[2] || "").trim().toLowerCase();
     if (seg.length === 3 && request.method === "PUT") {
+      if (!canAdmin(identity, owners)) return forbidden();
       if (!validAddr(address)) return json({ error: "invalid mailbox address" }, 400);
       const body = await request.json().catch(() => ({}));
       const display_name = String(body?.display_name ?? "").slice(0, 200) || null;
@@ -118,29 +132,34 @@ export async function route(request, env, ctx) {
       return json(await stub.upsertMailbox(address, display_name, members));
     }
     if (seg.length === 3 && request.method === "DELETE") {
+      if (!canAdmin(identity, owners)) return forbidden();
       if (!validAddr(address)) return json({ error: "invalid mailbox address" }, 400);
       return json(await stub.deleteMailbox(address));
     }
     if (seg.length === 4 && seg[3] === "messages" && request.method === "GET") {
+      if (!(await mayView(stub, identity, owners, address))) return forbidden();
       const before = Number(url.searchParams.get("before")) || 0;
       const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 100);
       return json(await stub.messages(address, before, limit));
     }
     if (seg.length === 4 && seg[3] === "send" && request.method === "POST") {
+      if (!(await mayView(stub, identity, owners, address))) return forbidden();
       const body = await request.json().catch(() => ({}));
       return json(await composeNew(env, stub, address, body, identity));
     }
   }
 
-  // /api/messages …
+  // /api/messages … A message belongs to a mailbox, so the row is fetched FIRST and the
+  // permission question is asked about its mailbox before anything is answered.
   if (seg[0] === "api" && seg[1] === "messages" && seg[2]) {
     const id = Number(seg[2]) || 0;
+    const m = await stub.message(id);
+    if (!m) return json({ error: "not found" }, 404);
+    if (!(await mayView(stub, identity, owners, m.mailbox))) return forbidden();
     if (seg.length === 3 && request.method === "GET") {
-      const m = await stub.message(id);
-      return m ? json(m) : json({ error: "not found" }, 404);
+      return json(await withRenderedHtml(env, m));
     }
     if (seg.length === 4 && seg[3] === "raw" && request.method === "GET") {
-      const m = await stub.message(id);
       if (!m?.r2_key) return json({ error: "no archived copy of this message" }, 404);
       const obj = await env.MAIL.get(m.r2_key);
       if (!obj) return json({ error: "archived copy is gone from R2" }, 404);
@@ -158,4 +177,47 @@ export async function route(request, env, ctx) {
   }
 
   return json({ error: "not found" }, 404);
+}
+
+// Membership is a property of the mailbox's configuration, so answering costs one DO call.
+// That is the FETCH path: the hop-minimising rule is about the object's single thread under
+// inbound mail, and this is a person clicking. An address with no configuration has no
+// members, so only an owner can see it — which is the right answer for mail that arrived at
+// an address nobody has claimed.
+async function mayView(stub, identity, owners, address) {
+  if (canAdmin(identity, owners)) return true;
+  return canView(identity, owners, await stub.config(address));
+}
+
+// html_rendered: what the reader actually puts in its iframe — cid: images inlined from the
+// archived .eml, remote images neutralised, markup sanitised. Built HERE, per read, and not
+// at parse time: a cid: image lives in a part that never enters the row, and a sanitiser is a
+// moving target that has to apply to mail which arrived before it was written.
+//
+// Never fails the read. A message whose archive is gone still opens; it opens without its
+// inline images and says so in render_note.
+async function withRenderedHtml(env, m) {
+  if (!m.html) return m;
+  let parts = [];
+  let note = null;
+  if (!m.r2_key) note = "no archived copy of this message — inline images were not resolved";
+  else if (Number(m.size) > RAW_PARSE_MAX) note = "the archived copy is over the parse cap — inline images were not resolved";
+  else {
+    try {
+      const obj = await env.MAIL.get(m.r2_key);
+      if (!obj) note = "the archived copy is gone from R2 — inline images were not resolved";
+      else parts = inlineParts(new Uint8Array(await obj.arrayBuffer()));
+    } catch (e) {
+      note = "the archived copy could not be read — inline images were not resolved";
+      console.error(JSON.stringify({ evt: "subetha.render_failed", id: m.id, error: String(e?.message || e).slice(0, 300) }));
+    }
+  }
+  try {
+    const r = renderHtml(m.html, { parts });
+    return { ...m, html_rendered: r.html, remote_images: r.remote_images, render_note: note };
+  } catch {
+    // The sandbox and the CSP the reader prepends are the defence; the sanitiser is depth. So
+    // the fallback is the stored html, unrendered, rather than a message that will not open.
+    return { ...m, html_rendered: m.html, remote_images: 0, render_note: "the html could not be rendered — shown as it was stored" };
+  }
 }

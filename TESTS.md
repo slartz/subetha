@@ -10,7 +10,7 @@ From the project root, with any Node that has `node:test` (18+). **No dependenci
 to install** — `node:test`, `node:assert/strict`, `node:fs`, `node:path`, `node:url` and
 nothing else. There is no test runner, no config file, and no build step.
 
-Expected: **45 tests, 45 pass, 0 fail.**
+Expected: **97 tests, 97 pass, 0 fail.**
 
 Run one file while working on it:
 
@@ -22,30 +22,63 @@ node --test test/build-mime.test.mjs
 
 | file | tests | covers |
 |---|---|---|
-| `test/build-mime.test.mjs` | 16 | the RFC 5322 builder |
-| `test/parse-mail.test.mjs` | 6 | the body parser, on the shapes that actually arrive |
+| `test/build-mime.test.mjs` | 19 | the RFC 5322 builder |
+| `test/html-render.test.mjs` | 26 | the reader's HTML pass and the reply quote |
+| `test/parse-mail.test.mjs` | 13 | the body parser and the one text derivation |
 | `test/loop-guard.test.mjs` | 10 | both loop predicates, including the branches that must NOT fire |
+| `test/perm.test.mjs` | 10 | the permission predicate: owner, member, stranger, bearer |
 | `test/archive.test.mjs` | 6 | the R2 key shape and its sanitising |
-| `test/structure.test.mjs` | 7 | the structural invariants — read on |
+| `test/structure.test.mjs` | 13 | the structural invariants — read on |
 
 **`build-mime.test.mjs`** — two of these are security tests and the rest correctness. Header
 injection through the Subject and through the display name is neutralised; an invalid address
 is refused rather than silently dropped; `validAddr` is deliberately strict; RFC 2047 encoding
 of non-ASCII subjects and display names round-trips; threading headers; `Re:` added once;
 header folding; the body surviving intact including non-ASCII; `multipart/alternative` when
-HTML is present; extra headers name-sanitised and CRLF-stripped; `msgIds`, `addrOf`,
-`headerValue`, and the quote block.
+HTML is present, **and a reply in that shape keeping its threading headers**; an empty or absent
+html alternative leaving the message `text/plain`; extra headers name-sanitised and
+CRLF-stripped; `msgIds`, `addrOf`, `headerValue`, `attribution` and the quote block.
 
 Note: this file contains a **literal NUL byte** in one fixture (`headerValue("a\0b")` must
 return `"ab"`). That is deliberate and must not be "cleaned up" — but it does mean `grep -r`
 treats the whole file as binary and silently skips it. Search it with a tool that reads UTF-8
 explicitly.
 
+**`html-render.test.mjs`** — two of these are security tests and the rest correctness.
+`inlineParts` finding what a `cid:` reference can point at; a `cid:` image inlined as a `data:`
+URI with the angle brackets stripped and the case ignored; `Content-Location` and filename as
+the fallback; a `cid:` that matches nothing left exactly as it was; the **2 MB per-image and
+6 MB total caps** leaving an over-cap `src` unresolved, and the same `cid:` twice costing the
+budget once; `url(cid:)` in CSS; **a remote image never loaded** — parked in `data-remote-src`
+behind a placeholder, counted, `srcset` dropped so it cannot override the placeholder, and the
+reader's two string replacements restoring it exactly; http, https and protocol-relative all
+counting as remote; **the sanitiser fixture** — script (terminated and not), `on*=` handlers,
+iframe, object, embed, form, base, `meta http-equiv`, `javascript:` and `vbscript:` including an
+entity-obfuscated one — with the message's own text, ordinary attributes, `<meta charset>` and
+`<style>` surviving; and the reply quote: its structure, the author's text escaped, **`cid:`
+images removed rather than inlined**, remote images left as the original had them, a `<style>`
+block dropped from the quote though the reader keeps it, and the sanitiser applied inside the
+blockquote because there is no sandbox in a mail client.
+
+**`perm.test.mjs`** — `parseOwners` normalisation; an owner by any case; the bearer as
+owner-equivalent and `"bearer"` never matching a member list as if it were an address; a member
+seeing its own mailboxes and no others and administering nothing; a stranger and a service-token
+`"access"` identity seeing nothing; an empty identity never being anybody; an unconfigured
+mailbox (`config()` → `null`) visible only to an owner; either member mode counting; **Gmail
+dots and `+tags` deliberately not normalised**; and `visibleMailboxes` filtering.
+
 **`parse-mail.test.mjs`** — non-multipart `text/plain`; `multipart/alternative` keeping both
 parts and not listing the container as an attachment; `multipart/mixed` **listing** the
 attachment rather than decoding it into the row; an HTML-only message still yielding text so a
-reply has something to quote; a malformed message losing its body and never the caller. The
-fourth test is the important one: it carries an ARC-Message-Signature whose `h=` field
+reply has something to quote; a malformed message losing its body and never the caller. It also
+covers the **one text derivation**, `stripHtml`, which has two readers — the stored text of an
+html-only message and the original quoted inside a plain-text reply: a link keeping its target as
+`text (url)` and not repeating itself when the text already IS the url, a link with nothing
+actionable (`#`, `cid:`, `javascript:`) keeping only its text, **images contributing nothing at
+all** — no alt, no base64, no placeholder — and the end of a block being ONE newline and never
+two, because Gmail wraps each individual line in a `<div>`.
+
+The ARC test is still the important one: it carries an ARC-Message-Signature whose `h=` field
 literally contains the text `content-type:content-transfer-encoding:`, which is the shape that
 makes an *unanchored* header lookup return garbage and silently eat the body. If someone
 "tidies" the anchored regexes in `mime.js`, this is the test that says so.
@@ -84,6 +117,24 @@ about code and not about the prose that discusses it.
 7. **An unset `ADMIN_SECRET` cannot authenticate anything** — the `!env.ADMIN_SECRET` guard
    must be present.
 
+And, since the permission model is only as good as the routes that ask it:
+
+8. **Every mutating mailbox route checks the admin permission before it mutates** —
+   `stub.upsertMailbox` and `stub.deleteMailbox` each have exactly one call site, and
+   `canAdmin(identity, owners)` appears between the route's branch and it.
+9. **Every non-mutating mailbox route checks the view permission** — `mayView(...)` between the
+   branch and `stub.messages` / `composeNew`.
+10. **The message routes resolve the row and ask about ITS mailbox first** — nothing (`GET`,
+    the raw download, the reply) is reached above `mayView(stub, identity, owners, m.mailbox)`.
+11. **The mailbox list is filtered by identity, never handed over whole** — `stub.mailboxes()`
+    may not reach a caller except through `visibleMailboxes`.
+12. **A reply carries an html alternative only when the original had one** — and `composeNew`
+    names no html at all. Also: exactly two modules call `buildMime({…})`, so the html
+    alternative reused the builder instead of growing a second one.
+13. **The reader never shows a message without the empty sandbox and the CSP** — both branches
+    of the srcdoc assignment, the stored html never going in unrendered, and exactly one thing
+    in `ui.js` able to set `loadRemote = true`.
+
 If you change the module layout, these are the tests that will fail first, and they are
 supposed to.
 
@@ -101,8 +152,15 @@ Be honest about the shape of the hole:
 * **No Access verification.** `access.js` is not tested — no JWT fixtures, no key fetch.
 * **No HTTP routing.** `route()` is read by `structure.test.mjs` but never called; status
   codes, body validation and error mapping are untested.
-* **No UI.** `ui.js` and `theme.js` produce a string that nothing asserts on.
-* **No `compose.js` behaviour.** Only its position in the import graph.
+* **No UI behaviour.** `ui.js` and `theme.js` produce a string; `structure.test.mjs` asserts a
+  few properties of that string (the sandbox, the CSP, the remote-image flag) but nothing runs
+  it in a browser.
+* **No `compose.js` behaviour.** Only its position in the import graph and, structurally, that
+  it passes an html alternative exactly when the original had one. It imports `send.js`, which
+  imports `cloudflare:email`, so it cannot be loaded under Node at all — which is why
+  `quoteHtml` lives in the pure `html-render.js` and is tested directly.
+* **No `withRenderedHtml`.** The R2 read and the `render_note` fallbacks in `index.js` are
+  unexercised; `inlineParts` and `renderHtml`, which do the work, are tested exhaustively.
 
 Adding `vitest` + `@cloudflare/vitest-pool-workers` would close most of this. It would also add
 a dependency and a build step, which is a non-goal (see `REQUIREMENTS.md`). The trade is
@@ -123,17 +181,31 @@ and after any change to the inbound path.
 3. **Check the stored copy.** It should appear in the message list within seconds, with the
    right subject and sender. Open it: the body renders, headers look right, attachments are
    listed. Click **Download raw** and confirm the `.eml` comes back from R2.
+   * Send one **from Outlook or Apple Mail with a signature logo**, and confirm the message
+     opens on the HTML view with the logo showing. A broken-image icon means the `cid:` did not
+     resolve — check `render_note` and that `r2_key` is set.
+   * Send one from a marketing tool or a newsletter and confirm the images do **not** load until
+     you click **Load N remote images**, and that they are blocked again when you reopen it.
 4. **Check the fan-out.** The row should show `fan-out 1/1`, and the message should have
    arrived in your own inbox. In `forward` mode it appears from the original sender; in `send`
    mode it appears from the mailbox with `Reply-To` the original sender.
 5. **Reply from the UI.** Type a reply, send it. Confirm it arrives at the original sender,
    that the `From` is the mailbox, that the original is quoted underneath, and that a
-   `direction=out` row now exists with your identity in `sent by`.
+   `direction=out` row now exists with your identity in `sent by`. Reply to the **formatted**
+   message too: the copy that arrives should be `multipart/alternative`, the quote should look
+   like the original rather than flattened, and it should carry no inline images.
 6. **Compose from the UI.** New message from the mailbox to yourself; confirm delivery and the
    stored outgoing row.
 7. **Check the loop guards did not fire wrongly** — a normal message must show a real fan-out,
    not `skip`.
-8. Only now add the other members.
+8. **Check the permission model with a second identity.** Add a colleague (or a second Access
+   identity of your own) to one mailbox's member list and nothing else, then sign in as them:
+   the mailbox selector should show that mailbox and no other, there should be no **New
+   mailbox…**, **Save**, **Delete mailbox** or **+ member**, the display name and member rows
+   should be read-only, and they should still be able to open, reply and compose. Then try
+   `GET /api/mailboxes/<another-mailbox>/messages` by hand and confirm it is `403`. Sign in as
+   somebody on no list at all and confirm the page loads, says so, and 403s everything else.
+9. Only now add the other members.
 
 If step 3 works but step 4 does not, the problem is sending, not receiving — check that the
 destination is a verified destination address (for `forward`) or that the zone is onboarded to

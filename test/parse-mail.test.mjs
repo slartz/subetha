@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseBody } from "../src/parse-mail.js";
+import { stripHtml } from "../src/mime.js";
 import { b64Lines } from "../src/build-mime.js";
 
 const crlf = (s) => s.replace(/\n/g, "\r\n");
@@ -117,4 +118,66 @@ Content-Type: text/html; charset=utf-8
 test("a malformed message loses its body, never the caller", () => {
   assert.deepEqual(parseBody(""), { text: null, html: null, attachments: [] });
   assert.deepEqual(parseBody(null), { text: null, html: null, attachments: [] });
+});
+
+// ---- the derived text ---------------------------------------------------
+//
+// ONE derivation, two readers: the stored text of an html-only message, and the original
+// quoted inside a plain-text reply. What it does to a marketing signature is therefore not a
+// cosmetic question — it is what a stranger reads underneath the answer they were sent.
+
+test("a link keeps its target, because a reader of a quote cannot hover", () => {
+  assert.equal(stripHtml('<a href="https://example.com/x">the docs</a>'), "the docs (https://example.com/x)");
+  assert.equal(stripHtml('<a href=\'https://example.com/x\'>the docs</a>'), "the docs (https://example.com/x)",
+    "single-quoted href");
+  assert.equal(stripHtml('<a class="btn" href="https://example.com/x" target="_blank">the <b>docs</b></a>'),
+    "the docs (https://example.com/x)", "other attributes and nested markup do not confuse it");
+});
+
+test("a link that is already its own url is not written out twice", () => {
+  assert.equal(stripHtml('<a href="https://example.com/x">https://example.com/x</a>'), "https://example.com/x");
+  assert.equal(stripHtml('<a href="https://example.com/x/">https://example.com/x</a>'), "https://example.com/x",
+    "a trailing slash is not a difference worth printing");
+  assert.equal(stripHtml('<a href="mailto:a@b.co">a@b.co</a>'), "a@b.co");
+  assert.equal(stripHtml('<a href="mailto:a@b.co">write to us</a>'), "write to us (a@b.co)");
+});
+
+test("a link with nothing a reader could act on keeps only its text", () => {
+  assert.equal(stripHtml('<a href="#top">back to top</a>'), "back to top");
+  assert.equal(stripHtml('<a href="cid:image001@x">logo</a>'), "logo");
+  assert.equal(stripHtml('<a href="javascript:alert(1)">click</a>'), "click");
+  assert.equal(stripHtml("<a>no href at all</a>"), "no href at all");
+  assert.equal(stripHtml('<a href="https://example.com/x"><img src="cid:i"></a>'), "https://example.com/x",
+    "an image-only link is worth its url");
+});
+
+test("images contribute nothing at all — no alt, no base64, no placeholder", () => {
+  const sig = '<p>Regards</p><img src="cid:image001.png@01D" alt="image001.png" width="120">' +
+    '<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUg">';
+  assert.equal(stripHtml(sig), "Regards");
+  assert.equal(/image001|base64|\[/.test(stripHtml(sig)), false);
+});
+
+test("br and the end of a block become ONE newline, never two", () => {
+  // Gmail wraps each individual line in a div and Outlook each in a p. A blank line per block
+  // would come back to the sender at twice the length they wrote.
+  assert.equal(stripHtml("one<br>two<br />three"), "one\ntwo\nthree");
+  assert.equal(stripHtml("<p>one</p><p>two</p>"), "one\ntwo");
+  assert.equal(stripHtml('<div class="a">one</div><div>two</div>'), "one\ntwo");
+  assert.equal(stripHtml("<ul><li>one</li><li>two</li></ul>"), "one\ntwo");
+  assert.equal(stripHtml("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>"), "a b\nc");
+  assert.equal(stripHtml("<h2>Title</h2><p>body</p>"), "Title\nbody");
+});
+
+test("blank runs collapse and no line keeps a stray indent", () => {
+  assert.equal(stripHtml("<p>one</p><br><br><br><p>two</p>"), "one\n\ntwo", "a deliberate gap survives, once");
+  assert.equal(stripHtml("<div>   one   </div><div>   two   </div>"), "one\ntwo");
+  assert.equal(stripHtml("<script>var x = 1</script><p>visible</p>"), "visible");
+  assert.equal(stripHtml("<style>p{color:red}</style><p>visible</p>"), "visible");
+});
+
+test("the derivation never throws on nothing", () => {
+  assert.equal(stripHtml(null), "");
+  assert.equal(stripHtml(undefined), "");
+  assert.equal(stripHtml(""), "");
 });

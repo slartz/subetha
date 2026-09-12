@@ -10,9 +10,18 @@
 // purpose — this file is itself one big template literal, and a stray ${ } in the client
 // code would be evaluated here, at render time, on the server.
 import { CSS } from "./theme.js";
+import { PIXEL } from "./html-render.js";
 
 const esc = (x) => String(x ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// The policy the reader puts at the top of the iframe document, BELOW the empty sandbox
+// rather than instead of it. Remote images are off until the operator asks: a remote image in
+// mail is a read receipt with a URL, and it was the sender who chose it. Built here and
+// interpolated into the client script, because a quote inside a quote inside this file's
+// template literal is how that string gets broken by the next person to edit it.
+const CSP = (img) => `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; ` +
+  `img-src ${img}; style-src 'unsafe-inline'; font-src data:">`;
 
 export function renderUi({ identity } = {}) {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -21,7 +30,7 @@ export function renderUi({ identity } = {}) {
 
 <div class="bar">
   <h1>SubEtha</h1>
-  <span class="who">${esc(identity || "")}</span>
+  <span class="who" id="who">${esc(identity || "")}</span>
   <div class="row">
     <label class="lbl" for="box">mailbox</label>
     <select id="box"></select>
@@ -89,10 +98,21 @@ async function api(path, opts) {
 }
 
 // ---- state -------------------------------------------------------------
-var boxes = [], cur = null, msgs = [], sel = null, oldest = 0, showHtml = false;
+var boxes = [], cur = null, msgs = [], sel = null, oldest = 0, showHtml = false, loadRemote = false;
+// Set from GET /api/me. It decides what this PAGE draws and nothing else — every route
+// checks the same question again on the server, because a hidden button is not a permission.
+var isOwner = false;
+var PIXEL = ${JSON.stringify(PIXEL)};
+var CSP_BLOCKED = ${JSON.stringify(CSP("data:"))};
+var CSP_REMOTE = ${JSON.stringify(CSP("data: https:"))};
 
 // ---- mailbox configuration --------------------------------------------
 function memberRow(email, mode) {
+  if (!isOwner) {
+    var ro = document.createElement("tr");
+    ro.innerHTML = "<td>" + esc(email || "") + '</td><td class="note">' + esc(mode || "") + "</td><td></td>";
+    return ro;
+  }
   // The two radios must share a name to be mutually exclusive, and that name must be unique
   // to the row or every row in the table becomes one radio group.
   var nm = "mode" + Math.random().toString(36).slice(2);
@@ -109,7 +129,9 @@ function readMembers() {
   var out = [];
   var rows = el("members").querySelectorAll("tr");
   for (var i = 0; i < rows.length; i++) {
-    var e = rows[i].querySelector(".m-email").value.trim().toLowerCase();
+    var f = rows[i].querySelector(".m-email");
+    if (!f) continue;                      // a read-only row: this caller is not an owner
+    var e = f.value.trim().toLowerCase();
     if (!e) continue;
     out.push({ email: e, mode: rows[i].querySelector(".m-snd").checked ? "send" : "forward" });
   }
@@ -120,7 +142,15 @@ function showConfig(b) {
   var tb = el("members"); tb.innerHTML = "";
   var ms = (b && b.members) || [];
   for (var i = 0; i < ms.length; i++) tb.appendChild(memberRow(ms[i].email, ms[i].mode));
-  if (!ms.length) tb.appendChild(memberRow("", "forward"));
+  if (!ms.length && isOwner) tb.appendChild(memberRow("", "forward"));
+}
+// A member sees the configuration and cannot change it: the editor's controls are removed
+// rather than disabled, so there is nothing to click that would come back 403.
+function applyRole() {
+  var ids = ["newbox", "save", "del", "addmember"];
+  for (var i = 0; i < ids.length; i++) if (el(ids[i])) el(ids[i]).style.display = isOwner ? "" : "none";
+  el("dn").disabled = !isOwner;
+  el("who").textContent = el("who").textContent + (isOwner ? " · owner" : "");
 }
 function boxLabel(b) {
   var s = b.address;
@@ -136,7 +166,12 @@ async function loadBoxes(keep) {
     o.value = boxes[i].address; o.textContent = boxLabel(boxes[i]);
     sb.appendChild(o);
   }
-  if (!boxes.length) { el("list").innerHTML = '<div class="body note">No mailbox has received anything yet, and none is configured. Use “New mailbox…”.</div>'; showConfig(null); return; }
+  if (!boxes.length) {
+    el("list").innerHTML = '<div class="body note">' + (isOwner
+      ? "No mailbox has received anything yet, and none is configured. Use “New mailbox…”."
+      : "No mailboxes. You are not on any mailbox’s member list — ask an owner to add you.") + "</div>";
+    showConfig(null); return;
+  }
   cur = (keep && boxes.some(function (b) { return b.address === keep; })) ? keep : boxes[0].address;
   sb.value = cur;
   showConfig(boxes.filter(function (b) { return b.address === cur; })[0]);
@@ -197,9 +232,17 @@ function fanoutTable(f) {
 }
 async function openMsg(id) {
   sel = await api("/api/messages/" + id);
-  showHtml = false;
+  // HTML FIRST when there is any. The html part is what the sender laid out and what every
+  // other mail client shows; the derived text is the fallback, not the default.
+  showHtml = !!sel.html;
+  loadRemote = false;
   renderList();
   render();
+}
+// Undo the neutralising, once, because the operator asked. The two replacements are exact
+// strings this worker wrote itself in html-render.js, in that order.
+function withRemote(s) {
+  return s.split(' src="' + PIXEL + '"').join("").split("data-remote-src=").join("src=");
 }
 function render() {
   var m = sel;
@@ -222,13 +265,16 @@ function render() {
 
   // No Reply on an outbound row: the only address to reply to there is the mailbox itself,
   // which would come straight back through Email Routing and be fanned out again.
+  var n = m.remote_images || 0;
   var buttons = '<div class="row">' +
     (m.direction === "out" ? "" : '<button id="breply">Reply</button>') +
-    (m.html ? '<button id="bhtml">' + (showHtml ? "Show text" : "View HTML") + "</button>" : "") +
+    (m.html ? '<button id="bhtml">' + (showHtml ? "Show text" : "Show HTML") + "</button>" : "") +
+    (showHtml && !loadRemote && n ? '<button id="bremote">Load ' + n + " remote image" + (n === 1 ? "" : "s") + "</button>" : "") +
     (m.r2_key ? '<a href="/api/messages/' + m.id + '/raw"><button>Download raw</button></a>' : "") +
     "</div>";
 
   el("msg").innerHTML = head + buttons +
+    (showHtml && m.render_note ? '<div class="note">' + esc(m.render_note) + "</div>" : "") +
     (showHtml ? '<iframe class="html" id="frame"></iframe>' : '<pre class="text">' + esc(m.text || "(no text body)") + "</pre>") +
     fanoutTable(m.fanout) +
     '<div id="replybox"></div>';
@@ -236,11 +282,16 @@ function render() {
   if (showHtml) {
     var f = el("frame");
     // Empty sandbox: no scripts, no same-origin, no forms, no navigation. The HTML in here
-    // was written by whoever sent the message.
+    // was written by whoever sent the message. The CSP below it is the second layer and the
+    // server's sanitiser is the third; the doctype keeps the document out of quirks mode.
     f.setAttribute("sandbox", "");
-    f.srcdoc = m.html || "";
+    var doc = m.html_rendered == null ? (m.html || "") : m.html_rendered;
+    f.srcdoc = "<!doctype html>" + (loadRemote ? CSP_REMOTE + withRemote(doc) : CSP_BLOCKED + doc);
   }
-  if (el("bhtml")) el("bhtml").onclick = function () { showHtml = !showHtml; render(); };
+  if (el("bhtml")) el("bhtml").onclick = function () { showHtml = !showHtml; loadRemote = false; render(); };
+  // One way only. Remote images are never loaded without this click, and clicking it is about
+  // this message in this pane — reopening the message blocks them again.
+  if (el("bremote")) el("bremote").onclick = function () { loadRemote = true; render(); };
   if (el("breply")) el("breply").onclick = replyBox;
 }
 function replyBox() {
@@ -314,6 +365,12 @@ el("del").onclick = async function () {
   catch (e) { el("cfgerr").textContent = String(e.message || e); }
 };
 
-loadBoxes(null).catch(function (e) { el("cfgerr").textContent = String(e.message || e); });
+// /api/me first: what this page draws depends on the answer, and drawing the editor for
+// somebody who cannot use it is how a UI teaches people to expect a 403.
+(async function () {
+  try { isOwner = !!(await api("/api/me")).is_owner; } catch (e) { isOwner = false; }
+  applyRole();
+  await loadBoxes(null);
+})().catch(function (e) { el("cfgerr").textContent = String(e.message || e); });
 </script>`;
 }

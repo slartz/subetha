@@ -8,6 +8,7 @@
 // Every outgoing message is archived to R2 and stored as a direction='out' row before the
 // route returns, so the mailbox's history is what was actually sent, both ways.
 import { buildMime, reSubject, quote, msgIds, newMessageId, domainOf, validAddr, headerValue, addrOf } from "./build-mime.js";
+import { quoteHtml } from "./html-render.js";
 import { sendRawTo } from "./send.js";
 import { r2Key, archive } from "./archive.js";
 
@@ -25,7 +26,7 @@ function checkedList(v, what) {
   return list;
 }
 
-async function deliver(env, stub, { cfg, to, cc, subject, text, inReplyTo, references, identity }) {
+async function deliver(env, stub, { cfg, to, cc, subject, text, html, inReplyTo, references, identity }) {
   const mailbox = cfg.address;
   const messageId = newMessageId(domainOf(mailbox));
   let raw;
@@ -33,7 +34,7 @@ async function deliver(env, stub, { cfg, to, cc, subject, text, inReplyTo, refer
     raw = buildMime({
       from: mailbox,
       fromName: cfg.display_name || mailbox.split("@")[0],
-      to, cc, subject, text, messageId, inReplyTo, references,
+      to, cc, subject, text, html, messageId, inReplyTo, references,
     });
   } catch (e) { fail(400, String(e?.message || e)); }
 
@@ -93,10 +94,15 @@ export async function replyToMessage(env, stub, id, body, identity) {
   const who = msg.from_name ? `${msg.from_name} <${msg.from_addr || ""}>` : (msg.from_addr || "someone");
   const quoted = `${text.replace(/\s+$/, "")}\n\n${quote(msg.text || "", { date: msg.date_hdr, from: who })}\n`;
 
+  // An html alternative ONLY when the original had one. A text-only message answered with a
+  // multipart/alternative is this worker inventing formatting nobody asked for, and the
+  // author's side of the reply is a plain textarea either way — the html part exists so the
+  // ORIGINAL survives the round trip looking like itself, tables, colours and all.
   return deliver(env, stub, {
     cfg, to: [target], cc,
     subject: reSubject(msg.subject || ""),
     text: quoted,
+    html: msg.html ? quoteHtml(text, { date: msg.date_hdr, from: who, html: msg.html }) : null,
     inReplyTo: msg.message_id || null,
     references: refs.join(" ") || null,
     identity,

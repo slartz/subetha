@@ -29,11 +29,21 @@ one program.
 6. **Let an authenticated operator**, through a web UI and an equivalent HTTP API:
    create and edit mailboxes and their member lists; read stored mail; download the raw
    `.eml`; reply as the mailbox; compose new mail from the mailbox.
-7. **Guard against mail loops** at both the message level and the member level.
-8. **Authenticate every request** — browser and automation alike — before any routing
-   decision.
-9. **Run with no build step and no dependencies**, so the source that is read is the source
-   that runs.
+7. **Scope what each identity may see and do**, on the server, on every route: an **owner**
+   (an address in `OWNERS`, or the `ADMIN_SECRET` bearer) sees and configures every mailbox; a
+   **member** sees only the mailboxes their address is on and may read, reply and compose from
+   them but change nothing; anybody else is refused everything that names a mailbox or a
+   message.
+8. **Show a stored HTML message safely, and looking like itself.** Inline `cid:` images
+   resolved from the archive, remote images never loaded without an explicit click, the markup
+   sanitised, and the whole thing inside a sandboxed iframe under a restrictive CSP.
+9. **Carry the original HTML into a reply**, so a formatted message quoted back to its sender
+   still looks like what they sent.
+10. **Guard against mail loops** at both the message level and the member level.
+11. **Authenticate every request** — browser and automation alike — before any routing
+    decision.
+12. **Run with no build step and no dependencies**, so the source that is read is the source
+    that runs.
 
 ## Fan-out semantics
 
@@ -70,16 +80,24 @@ These are decisions, not missing features. A PR that adds one of them is out of 
 * **Not a mail client.** No folders, labels, flags, read/unread state, or conversation
   threading view.
 * **No search.** Paging backwards by id is the whole retrieval story.
-* **No rich compose.** Outgoing mail is plain text; no HTML editor, no attachments on send.
+* **No rich compose.** You write plain text: no HTML editor, no attachments on send. A reply to
+  a message that HAD an html part goes out as `multipart/alternative` so the quoted original
+  survives looking like itself — but the author's half is the same plain text in both parts, and
+  a reply to a text-only message, like any new message, stays `text/plain`.
 * **No attachment extraction.** Attachments are listed (filename, type, size); the bytes stay
   in the archived `.eml`.
-* **No multi-tenancy or per-user permissions.** One Durable Object holds every mailbox and
-  whoever the Access policy admits sees all of them.
+* **No multi-tenancy.** One Durable Object instance holds every mailbox and one `OWNERS` list
+  governs the lot. Owners and members scope *visibility*, not storage: this is one operator's
+  install with some colleagues on it, not a service with tenants. There are two roles and there
+  will not be a third, no per-mailbox admin delegation, and no groups.
 * **No message deletion.** Removing a mailbox removes its configuration only; the stored rows
   and the R2 archive are untouched.
 * **No dependencies, no build step, no framework** — including in the UI.
 * **No external resource loaded by the UI** — no font CDN, no script tag, no icon sprite. The
-  Access login is the only thing between this page and every mailbox in the zone.
+  Access login is the only thing between this page and every mailbox in the zone. The reader's
+  iframe extends this to the MAIL as well: no remote image loads until the operator asks.
+* **No fetch route for MIME parts.** Inline images are resolved server-side into the HTML. A
+  route would have to weaken the reader's empty `sandbox` to be reachable at all.
 
 ## Constraints
 
