@@ -165,6 +165,8 @@ button.link { background: none; border: none; box-shadow: none; color: var(--acc
 .badge.in  { background: var(--v-t); color: var(--v); border-color: transparent; }
 .badge.out { background: var(--m-t); color: var(--m); border-color: transparent; }
 .badge.unconf { background: var(--i-t); color: var(--i); border-color: transparent; }
+/* Muted is quiet on purpose: it is the one state the operator chose, not one that happened. */
+.badge.muted { background: var(--a-t); color: var(--a); border-color: transparent; }
 .badge.bad { background: color-mix(in srgb, #b00 12%, transparent); color: #b00; border-color: transparent; }
 
 table.kv { width: 100%; border-collapse: collapse; margin-bottom: var(--s3); }

@@ -25,24 +25,29 @@ one program.
    storage, queryable by mailbox, newest first.
 4. **Fan a copy out to a member list** configured per mailbox, in one of two modes per member
    (see below).
-5. **Record the outcome of every fan-out attempt**, including deliberate skips and why.
-6. **Let an authenticated operator**, through a web UI and an equivalent HTTP API:
+5. **Record the outcome of every fan-out attempt**, including deliberate skips and why — and
+   **show each member their own latest outcome** on the row that can fix it, because a member
+   whose every delivery fails is otherwise a silent failure.
+6. **Let an owner mute mail that should not be fanned out**, by sender, sender domain, subject
+   or `List-Id`. A muted message is still archived, still stored and still readable; what stops
+   is the fan-out. Muting is not deleting, and there is no rule action that is.
+7. **Let an authenticated operator**, through a web UI and an equivalent HTTP API:
    create and edit mailboxes and their member lists; read stored mail; download the raw
-   `.eml`; reply as the mailbox; compose new mail from the mailbox.
-7. **Scope what each identity may see and do**, on the server, on every route: an **owner**
+   `.eml`; reply as the mailbox; compose new mail from the mailbox; add and remove mute rules.
+8. **Scope what each identity may see and do**, on the server, on every route: an **owner**
    (an address in `OWNERS`, or the `ADMIN_SECRET` bearer) sees and configures every mailbox; a
    **member** sees only the mailboxes their address is on and may read, reply and compose from
    them but change nothing; anybody else is refused everything that names a mailbox or a
    message.
-8. **Show a stored HTML message safely, and looking like itself.** Inline `cid:` images
+9. **Show a stored HTML message safely, and looking like itself.** Inline `cid:` images
    resolved from the archive, remote images never loaded without an explicit click, the markup
    sanitised, and the whole thing inside a sandboxed iframe under a restrictive CSP.
-9. **Carry the original HTML into a reply**, so a formatted message quoted back to its sender
-   still looks like what they sent.
-10. **Guard against mail loops** at both the message level and the member level.
-11. **Authenticate every request** — browser and automation alike — before any routing
+10. **Carry the original HTML into a reply**, so a formatted message quoted back to its sender
+    still looks like what they sent.
+11. **Guard against mail loops** at both the message level and the member level.
+12. **Authenticate every request** — browser and automation alike — before any routing
     decision.
-12. **Run with no build step and no dependencies**, so the source that is read is the source
+13. **Run with no build step and no dependencies**, so the source that is read is the source
     that runs.
 
 ## Fan-out semantics
@@ -69,16 +74,22 @@ Rules that hold in both modes:
   machine-generated (`Auto-Submitted` ≠ `no`, `Precedence: bulk|junk|list`) or already carries
   this worker's own hop marker.
 * `List-Id` is **not** a suppression reason: a shared mailbox may legitimately subscribe to a
-  mailing list.
+  mailing list. It is, however, stored on the row and **mutable by rule**, which is the
+  difference between "this worker decided" and "an owner decided".
 * Mail for an address with no configuration is stored and marked `unconfigured`; nothing is
   fanned out and nothing is rejected.
+* A message matching a mute rule is stored `hidden`, attributed to the rule that matched it,
+  and fanned out to nobody. The loop guards are evaluated first: a message they suppress is
+  recorded as suppressed rather than as muted.
 
 ## Must not do (non-goals)
 
 These are decisions, not missing features. A PR that adds one of them is out of scope.
 
 * **Not a mail client.** No folders, labels, flags, read/unread state, or conversation
-  threading view.
+  threading view. Mute rules are the one exception and they are deliberately the smallest one:
+  a single action (mute), four fields, two comparisons, **no regular expressions**, and no
+  action that moves, tags, replies to or deletes anything.
 * **No search.** Paging backwards by id is the whole retrieval story.
 * **No rich compose.** You write plain text: no HTML editor, no attachments on send. A reply to
   a message that HAD an html part goes out as `multipart/alternative` so the quoted original
@@ -91,7 +102,8 @@ These are decisions, not missing features. A PR that adds one of them is out of 
   install with some colleagues on it, not a service with tenants. There are two roles and there
   will not be a third, no per-mailbox admin delegation, and no groups.
 * **No message deletion.** Removing a mailbox removes its configuration only; the stored rows
-  and the R2 archive are untouched.
+  and the R2 archive are untouched. Muting hides a row and stops its fan-out — it is not a
+  delete wearing a different word, and no rule action may become one.
 * **No dependencies, no build step, no framework** — including in the UI.
 * **No external resource loaded by the UI** — no font CDN, no script tag, no icon sprite. The
   Access login is the only thing between this page and every mailbox in the zone. The reader's

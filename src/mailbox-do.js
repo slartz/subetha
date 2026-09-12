@@ -11,6 +11,7 @@
 // RPC surface only — no fetch() handler on the object; callers invoke its methods directly.
 import { DurableObject } from "cloudflare:workers";
 import { withMemberStatus } from "./fanout-status.js";
+import { firstMatch, sqlPredicate } from "./rules.js";
 
 const now = () => Date.now();
 
@@ -32,12 +33,34 @@ export class MailboxDO extends DurableObject {
         from_addr TEXT, from_name TEXT, reply_to TEXT, to_addrs TEXT, cc_addrs TEXT,
         subject TEXT, date_hdr TEXT, received_at INTEGER,
         text TEXT, html TEXT, r2_key TEXT, size INTEGER, attachments_json TEXT,
-        unconfigured INTEGER DEFAULT 0, sent_by TEXT)`);
+        unconfigured INTEGER DEFAULT 0, sent_by TEXT,
+        list_id TEXT, hidden INTEGER NOT NULL DEFAULT 0, muted_by INTEGER)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_box ON messages(mailbox, id)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS fanout_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         message_row INTEGER, member TEXT, mode TEXT, ok INTEGER, error TEXT, at INTEGER)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS fanout_row ON fanout_log(message_row)`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mailbox TEXT NOT NULL,
+        field TEXT NOT NULL CHECK(field IN ('from','from_domain','subject','list_id')),
+        pattern TEXT NOT NULL,
+        action TEXT NOT NULL DEFAULT 'mute' CHECK(action IN ('mute')),
+        created_by TEXT, created_at INTEGER, hits INTEGER NOT NULL DEFAULT 0)`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS rules_box ON rules(mailbox)`);
+
+      // MIGRATION. The three columns above are in the CREATE for a new object; an object that
+      // already holds mail was created without them, and this brings it to the same shape.
+      // Additive only, and guarded by PRAGMA rather than by a version number — ADD COLUMN on a
+      // column that exists throws, and a throw in here is a constructor that fails on every
+      // RPC afterwards, which on this path means mail arriving at a Durable Object that cannot
+      // start. There is no migration window: the object is live the whole time.
+      const have = new Set(this.sql.exec("PRAGMA table_info(messages)").toArray().map((c) => c.name));
+      for (const [name, ddl] of [
+        ["list_id", "list_id TEXT"],
+        ["hidden", "hidden INTEGER NOT NULL DEFAULT 0"],
+        ["muted_by", "muted_by INTEGER"],
+      ]) if (!have.has(name)) this.sql.exec(`ALTER TABLE messages ADD COLUMN ${ddl}`);
     });
   }
 
@@ -52,9 +75,10 @@ export class MailboxDO extends DurableObject {
     return { ...box, members: this.#rows("SELECT email, mode FROM members WHERE mailbox=? ORDER BY email", address) };
   }
 
-  // Configured mailboxes UNION addresses that have only ever received mail. An address the
-  // routing rule points here but nobody has configured has no mailboxes row at all, so
-  // listing the table alone would hide exactly the thing the operator needs to see.
+  // Configured mailboxes UNION addresses that have only ever received mail UNION addresses
+  // that only have a rule. An address the routing rule points here but nobody has configured
+  // has no mailboxes row at all, so listing the table alone would hide exactly the thing the
+  // operator needs to see — and a mailbox muted before it was configured is the same case.
   mailboxes() {
     return this.#rows(`
       SELECT a.address AS address,
@@ -63,8 +87,12 @@ export class MailboxDO extends DurableObject {
              (m.address IS NOT NULL) AS configured,
              (SELECT COUNT(*) FROM members WHERE mailbox = a.address) AS member_count,
              (SELECT COUNT(*) FROM messages WHERE mailbox = a.address) AS message_count,
-             (SELECT COUNT(*) FROM messages WHERE mailbox = a.address AND unconfigured = 1) AS unconfigured_count
-      FROM (SELECT address FROM mailboxes UNION SELECT mailbox AS address FROM messages) a
+             (SELECT COUNT(*) FROM messages WHERE mailbox = a.address AND unconfigured = 1) AS unconfigured_count,
+             (SELECT COUNT(*) FROM rules WHERE mailbox = a.address) AS rule_count,
+             (SELECT COUNT(*) FROM messages WHERE mailbox = a.address AND hidden = 1) AS muted_count
+      FROM (SELECT address FROM mailboxes
+            UNION SELECT mailbox AS address FROM messages
+            UNION SELECT mailbox AS address FROM rules) a
       LEFT JOIN mailboxes m ON m.address = a.address
       ORDER BY a.address`)
       // The editor needs the member list, not just its size, and a shared mailbox has a
@@ -117,9 +145,61 @@ export class MailboxDO extends DurableObject {
     return withMemberStatus({ ...this.config(address), member_status: this.memberStatus(address) });
   }
 
+  // ---------- rules ----------
+
+  /** Every rule on this mailbox, oldest first — which is also the order they are matched in. */
+  rules(mailbox) {
+    return this.#rows("SELECT * FROM rules WHERE mailbox=? ORDER BY id", mailbox);
+  }
+
+  // Create the rule, then apply it BACKWARDS over what is already stored: a rule added after
+  // the fact is almost always a rule that was wanted before it, and the newsletter the owner
+  // is muting is sitting in the list as they type. One UPDATE in SQL rather than a
+  // read-modify-write per row — the object's thread is shared with every mailbox's inbound.
+  //
+  // Rows already hidden are left alone, so the rule that muted them first keeps the hit and
+  // the attribution; `hits` therefore counts messages muted BY THIS RULE and nothing else.
+  addRule(mailbox, field, pattern, created_by) {
+    const p = sqlPredicate({ field, pattern });
+    if (!p) throw new Error(`unknown rule field: ${String(field).slice(0, 40)}`);
+    this.sql.exec(
+      "INSERT INTO rules(mailbox,field,pattern,action,created_by,created_at,hits) VALUES(?,?,?,'mute',?,?,0)",
+      mailbox, field, pattern, created_by ?? null, now());
+    const id = this.#lastId();
+    const r = this.sql.exec(
+      `UPDATE messages SET hidden=1, muted_by=?
+       WHERE mailbox=? AND direction='in' AND hidden=0 AND ${p.sql}`,
+      id, mailbox, p.arg);
+    const hidden_now = r.rowsWritten;
+    if (hidden_now) this.sql.exec("UPDATE rules SET hits = hits + ? WHERE id=?", hidden_now, id);
+    return { rule: this.#rows("SELECT * FROM rules WHERE id=?", id)[0] ?? null, hidden_now };
+  }
+
+  // The rule goes; the messages it hid STAY hidden. Un-hiding them would be a second bulk
+  // action — the opposite one — hiding inside a delete, and an owner who removes a rule means
+  // "stop muting from now on" far more often than "resurface three months of newsletters".
+  // Un-hiding is per message, deliberate, and owner-only.
+  deleteRule(mailbox, id) {
+    const n = Number(id) || 0;
+    const r = this.sql.exec("DELETE FROM rules WHERE id=? AND mailbox=?", n, mailbox);
+    return { deleted: n, removed: r.rowsWritten, messages_kept_hidden: true };
+  }
+
+  // Manual override for one message. Un-hiding CLEARS muted_by: the row is no longer muted by
+  // that rule, and leaving the id on it would have the UI explaining a mute that is not in
+  // force. The rule itself is untouched, so the next message matching it is muted again.
+  setHidden(id, hidden) {
+    const h = hidden ? 1 : 0;
+    const n = Number(id) || 0;
+    this.sql.exec(`UPDATE messages SET hidden=?, muted_by=${h ? "muted_by" : "NULL"} WHERE id=?`, h, n);
+    return this.#rows("SELECT id, hidden, muted_by FROM messages WHERE id=?", n)[0] ?? null;
+  }
+
   // Messages are KEPT. They are the mailbox's history and deleting the configuration is an
   // administrative act, not a decision to destroy mail; the rows stay queryable by address
-  // and the archive in R2 is untouched either way.
+  // and the archive in R2 is untouched either way. Rules are kept for the same reason and with
+  // the same consequence: mail to the address is still stored, still muted where a rule says
+  // so, and the address stays in the mailbox list carrying its rule count.
   deleteMailbox(address) {
     this.sql.exec("DELETE FROM members WHERE mailbox=?", address);
     const r = this.sql.exec("DELETE FROM mailboxes WHERE address=?", address);
@@ -134,21 +214,31 @@ export class MailboxDO extends DurableObject {
    */
   inbound(row) {
     const cfg = this.config(row.mailbox);
+    // Rules are evaluated HERE, and only here. This is the one call that already knows the
+    // mailbox, has the row in hand and is about to hand back the member list, so muting costs
+    // no extra hop — the inbound path is still exactly two. A match stores the row hidden and
+    // hands the worker NO members, which is what makes "muted" mean "nothing was forwarded"
+    // rather than "the UI filters it afterwards".
+    const rule = firstMatch(this.rules(row.mailbox), row);
     this.sql.exec(
       `INSERT INTO messages(mailbox,message_id,in_reply_to,references_hdr,direction,from_addr,from_name,
         reply_to,to_addrs,cc_addrs,subject,date_hdr,received_at,text,html,r2_key,size,attachments_json,
-        unconfigured,sent_by)
-       VALUES(?,?,?,?,'in',?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+        unconfigured,sent_by,list_id,hidden,muted_by)
+       VALUES(?,?,?,?,'in',?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)`,
       row.mailbox, row.message_id ?? null, row.in_reply_to ?? null, row.references_hdr ?? null,
       row.from_addr ?? null, row.from_name ?? null, row.reply_to ?? null, row.to_addrs ?? null,
       row.cc_addrs ?? null, row.subject ?? null, row.date_hdr ?? null, row.received_at ?? now(),
       row.text ?? null, row.html ?? null, row.r2_key ?? null, row.size ?? null,
-      row.attachments_json ?? "[]", cfg ? 0 : 1);
+      row.attachments_json ?? "[]", cfg ? 0 : 1,
+      row.list_id ?? null, rule ? 1 : 0, rule ? rule.id : null);
+    const id = this.#lastId();
+    if (rule) this.sql.exec("UPDATE rules SET hits = hits + 1 WHERE id=?", rule.id);
     return {
-      id: this.#lastId(),
+      id,
       configured: !!cfg,
       display_name: cfg?.display_name ?? null,
-      members: cfg?.members ?? [],
+      members: rule ? [] : (cfg?.members ?? []),
+      muted_by: rule ? { id: rule.id, field: rule.field, pattern: rule.pattern } : null,
     };
   }
 
@@ -181,17 +271,23 @@ export class MailboxDO extends DurableObject {
 
   // ---------- reading ----------
 
-  /** Newest first, no bodies. `before` pages backwards by id. */
-  messages(address, before, limit) {
+  /**
+   * Newest first, no bodies. `before` pages backwards by id.
+   *
+   * Muted messages are EXCLUDED unless asked for. A mute is "I do not want to see this", so
+   * hiding it in the default list is the whole feature; the rows are never deleted and
+   * includeHidden brings them straight back.
+   */
+  messages(address, before, limit, includeHidden) {
     const n = Math.min(Math.max(Number(limit) || 50, 1), 100);
     const b = Number(before) || 0;
     const rows = this.#rows(`
       SELECT m.id, m.direction, m.from_addr, m.from_name, m.subject, m.date_hdr, m.received_at,
-             m.size, m.unconfigured, m.sent_by, m.to_addrs, m.attachments_json,
+             m.size, m.unconfigured, m.sent_by, m.to_addrs, m.attachments_json, m.hidden, m.muted_by,
              (SELECT COUNT(*) FROM fanout_log f WHERE f.message_row = m.id) AS fanout_total,
              (SELECT COUNT(*) FROM fanout_log f WHERE f.message_row = m.id AND f.ok = 1) AS fanout_ok
       FROM messages m
-      WHERE m.mailbox = ? ${b ? "AND m.id < ?" : ""}
+      WHERE m.mailbox = ? ${includeHidden ? "" : "AND m.hidden = 0"} ${b ? "AND m.id < ?" : ""}
       ORDER BY m.id DESC LIMIT ?`, ...(b ? [address, b, n] : [address, n]));
     return rows.map(({ attachments_json, ...r }) => ({
       ...r,

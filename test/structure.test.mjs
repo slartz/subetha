@@ -141,6 +141,26 @@ test("the message routes resolve the row and ask about ITS mailbox before answer
   ]) assert.ok(s.indexOf(answered) > guard, `${answered} is reached before the check`);
 });
 
+test("muting is administration: creating, deleting and hiding are owner-only", () => {
+  // A mute rule stops the fan-out for EVERY member of the mailbox, and hiding a message hides
+  // it from everybody. Both are the member list's kind of question, not the reader's.
+  const s = code("index.js");
+  for (const [route, act] of [
+    ['seg[3] === "rules" && request.method === "POST"', "stub.addRule("],
+    ['seg[3] === "rules" && request.method === "DELETE"', "stub.deleteRule("],
+    ['seg[3] === "hidden" && request.method === "POST"', "stub.setHidden("],
+  ]) {
+    assert.equal(count(s, act), 1, `${act} must have exactly one call site to guard`);
+    assert.match(between(s, route, act), /canAdmin\(identity, owners\)/,
+      `${act} is reachable without the admin check — a member could silence a mailbox for everyone`);
+  }
+  // Reading them is a view question: a member who cannot see the rules is a member wondering
+  // where the mail went.
+  assert.match(between(s, 'seg[3] === "rules" && request.method === "GET"', "stub.rules("),
+    /mayView\(stub, identity, owners, address\)/,
+    "the rule list names a mailbox, so it asks the same question every other such route asks");
+});
+
 test("the mailbox list is filtered by identity, never handed over whole", () => {
   const s = code("index.js");
   assert.match(s, /json\(visibleMailboxes\(await stub\.mailboxes\(\), identity, owners\)\)/);

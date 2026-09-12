@@ -80,6 +80,10 @@ export async function handleInbound(message, env, ctx) {
     cc_addrs: headerValue(h.get("cc")).slice(0, 2000) || null,
     subject: decodeWords(headerValue(h.get("subject"))).slice(0, 1000) || null,
     date_hdr: headerValue(h.get("date")).slice(0, 200) || null,
+    // Stored for the mute rules, not for the loop guard: List-Id is deliberately NOT a
+    // suppression reason (a shared mailbox may subscribe to a list), but "mute this list" is
+    // the rule an owner reaches for first, and it needs something to match on.
+    list_id: headerValue(h.get("list-id")).slice(0, 400) || null,
     received_at: receivedAt,
     text: body.text ?? null,
     html: body.html ?? null,
@@ -100,6 +104,15 @@ export async function handleInbound(message, env, ctx) {
   } else if (suppressed) {
     // One row so the UI can say why nothing left, rather than showing a silent 0/0.
     results.push({ member: null, mode: "skip", ok: true, error: `loop guard: ${suppressed} — fan-out suppressed` });
+  } else if (stored.muted_by) {
+    // The DO already stored this row hidden and handed back no members. Same precedent as the
+    // skip row above: one row saying why nothing left, so the message's fan-out table answers
+    // the question instead of a silent 0/0. The loop guard is checked FIRST and still wins —
+    // it is about the account's sending quota, and a mute is about one person's attention.
+    results.push({
+      member: null, mode: "rule", ok: true,
+      error: `rule #${stored.muted_by.id}: ${stored.muted_by.field} ${stored.muted_by.pattern} — fan-out muted`,
+    });
   } else {
     const routed = parseDomains(env.ROUTED_DOMAINS);
     // Who wrote it, for the send-mode copies only. A send-mode copy arrives FROM the mailbox
@@ -152,6 +165,8 @@ export async function handleInbound(message, env, ctx) {
   console.log(JSON.stringify({
     evt: "subetha.received", mailbox, id: stored.id, size,
     configured: stored.configured, suppressed: suppressed || null,
+    // The rule's id and nothing else: a subject pattern is content, and content is not logged.
+    muted_by: stored.muted_by ? stored.muted_by.id : null,
     delivered: results.filter((r) => r.ok && r.mode !== "skip").length,
     failed: results.filter((r) => !r.ok).length,
   }));

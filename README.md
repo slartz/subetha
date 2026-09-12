@@ -5,7 +5,7 @@ is **fanned out to a member list**, **kept as a stored copy** you can read in a 
 and **replied to or composed from** that same address — sending natively through Cloudflare
 Email Routing and Email Sending, with no build step, no framework and no dependencies. Named
 for the sub-etha net: one address, everybody listening. From the outside each mailbox behaves
-like an ordinary mailbox; from the inside it is ~2,100 lines of plain JavaScript and a SQLite
+like an ordinary mailbox; from the inside it is ~2,800 lines of plain JavaScript and a SQLite
 Durable Object.
 
 ## Why this exists
@@ -45,6 +45,8 @@ this is.
 | `mime.js` | MIME primitives (pure): anchored header lookup, part splitting, charsets |
 | `mailbox-do.js` | `MailboxDO` — all state, SQLite, one instance, RPC only |
 | `loop-guard.js` | the two loop predicates (pure) |
+| `rules.js` | mute rules (pure): matching, validating, and the same rule as a SQL predicate |
+| `fanout-status.js` | delivery status (pure): classifying a fan-out error into something to act on |
 | `html-render.js` | the HTML pass (pure): `cid:` inlining, remote-image blocking, sanitising, the reply quote |
 | `perm.js` | the permission predicate (pure): owner, member, neither |
 | `archive.js` | R2 key shape and the one function that writes to the bucket |
@@ -75,7 +77,9 @@ by every route.
 | on a mailbox's member list, in either mode | — | yes | — |
 | see it in the mailbox list | every mailbox | only its own | nothing |
 | read, download raw, reply, compose from it | any mailbox | its own | 403 |
+| see its mute rules | any mailbox | its own | 403 |
 | create, edit or delete a mailbox; edit members | yes | 403 | 403 |
+| create or delete a mute rule; hide or un-hide a message | yes | 403 | 403 |
 
 Identity is the Access JWT's `email` claim, lowercased; the `ADMIN_SECRET` bearer is
 owner-equivalent. Someone who is neither still gets the page at `/` — with an empty list and a
@@ -127,23 +131,35 @@ than lost.
 **`send`** — a new message this worker builds and hands to Cloudflare Email Sending:
 
 ```
-From:     "<mailbox display name>" <mailbox@example.com>
+From:     "<sender> via <mailbox display name>" <mailbox@example.com>
 Reply-To: <the original sender>
 X-Subetha-Hop: 1
 X-Subetha-Original-From: <the original From header, verbatim>
+
+From: Alice <alice@example.com> — via support@example.com      ← one line, above the body
+
+<the original body>
 ```
+
+The **address** stays the mailbox's, because that is what DMARC aligns against; the **display
+name** and one line at the top of the body say who actually wrote, in the two places a reading
+pane will show it. (An html message keeps its own markup, with the same line in a small muted
+`<div>` above it.) Without that, every message in a send-mode mailbox looks like it came from
+the mailbox itself and the real sender survives only in headers nobody's client displays.
 
 No verification of the destination is needed, so `send` reaches anyone — but it **uses the
 account's sending quota**, and it **re-originates the message**. That last point matters for
 DMARC: the recipient sees mail from your mailbox address, authenticated by your domain, not
-mail from the original sender. It will pass DMARC where a plain forward might fail it, and in
-exchange the original sender's identity survives only in `Reply-To` and
-`X-Subetha-Original-From`. Pick `forward` when you want the message to look like the sender's;
-pick `send` when the destination is not a verified address or when forwarding keeps failing
-authentication.
+mail from the original sender. It will pass DMARC where a plain forward might fail it. Pick
+`forward` when you want the message to look like the sender's; pick `send` when the destination
+is not a verified address or when forwarding keeps failing authentication.
 
 Every member's outcome — delivered, failed, or skipped and why — is a row in `fanout_log`,
-which the UI shows per message.
+which the UI shows per message. **The latest outcome is also shown on the member's own row** in
+the editor: `✓ delivered 20m ago`, or a red `⚠` with one sentence saying what to do about it and
+the raw error in the tooltip. The failure that makes this worth having is a member added in
+`forward` mode whose address is not a verified destination on the account: every message to them
+fails, the other members still get theirs, and until it is on the row nothing says so.
 
 ## Loop guards
 
@@ -170,6 +186,44 @@ normal thing to want, and suppressing on `List-Id` would break it silently.
 Skips are recorded in `fanout_log` with `mode='skip'` and `ok=1`, so the UI can say *why*
 nothing left rather than showing a silent 0/0. That does mean the list view's `ok/total`
 counts a skip as a success; the detail pane spells out each member's outcome.
+
+## Rules: muting
+
+A shared address collects mail nobody wants sent on to five people — a newsletter somebody
+subscribed it to, a vendor's marketing, a monitoring alert that fires every night. The member
+list cannot express that: it is about *who*, and this is about *what*.
+
+Open a message, click **Mute…**, and pick one of three offers, each prefilled from the message
+and each editable:
+
+| field | matches |
+|---|---|
+| `from` | the sender's address, exactly |
+| `from_domain` | the sender's domain, exactly — `example.com` does **not** match `mail.example.com` |
+| `subject` | the subject **contains** the pattern |
+| `list_id` | the `List-Id` header **contains** the pattern |
+
+What a mute does, and what it deliberately does not:
+
+* **It stops the fan-out.** The rule is evaluated inside the Durable Object as the message is
+  stored, so nothing is forwarded and nothing is sent. It is not a UI filter.
+* **Nothing is deleted.** The raw message is still archived to R2, the row is still stored, and
+  the message is still readable — tick **show muted** in the message list, where it carries a
+  `muted · rule #n` badge. There is no delete in SubEtha and a rule is not a way to get one.
+* **Creating a rule is retroactive**: existing stored messages that match are hidden too, and
+  the UI tells you how many. **Deleting a rule is not** — messages it already muted stay muted,
+  because "stop muting from now on" is what removing a rule almost always means. Un-hiding is
+  per message, with **Unhide** on the message itself.
+* **No regular expressions**, on purpose. Two comparisons, equals and contains. A pattern is
+  typed into a small box and then runs on the inbound path inside a single-threaded object: a
+  regex there is a typo away from muting everything, or from backtracking on a subject a
+  stranger chose.
+* **Owner-only to create or delete**, visible to anyone who can see the mailbox. A mute stops
+  the mail for *every* member, so it belongs with the member list; but a member who cannot see
+  the rules is a member wondering where the mail went.
+* **The loop guards run first.** A message they suppress is recorded as suppressed, not as muted.
+
+Rules live under the members editor, with each one's hit count.
 
 ## Deploy
 
@@ -218,14 +272,18 @@ unauthenticated route, not even a health check.
 |---|---|---|---|
 | GET | `/` | the UI | anyone authenticated |
 | GET | `/api/me` | `{identity, is_owner}` — what the UI draws itself from | anyone authenticated |
-| GET | `/api/mailboxes` | the mailboxes **this identity may see**: address, display name, members, counts, unconfigured count | anyone authenticated |
-| PUT | `/api/mailboxes/:address` | `{display_name, members:[{email, mode}]}` — members are **replaced**, not merged | owner |
+| GET | `/api/mailboxes` | the mailboxes **this identity may see**: address, display name, members (each with `last`), counts, `rule_count`, `muted_count` | anyone authenticated |
+| PUT | `/api/mailboxes/:address` | `{display_name, members:[{email, mode}]}` — members are **replaced**, not merged; the response carries each member's `last` | owner |
 | DELETE | `/api/mailboxes/:address` | removes the configuration; **stored messages are kept** | owner |
-| GET | `/api/mailboxes/:address/messages?before=&limit=` | newest first, no bodies, ≤100 per page | owner or member |
+| GET | `/api/mailboxes/:address/messages?before=&limit=&hidden=` | newest first, no bodies, ≤100 per page; muted messages are excluded unless `hidden=1` | owner or member |
 | POST | `/api/mailboxes/:address/send` | `{to, cc?, subject, text}` — compose from the mailbox | owner or member |
+| GET | `/api/mailboxes/:address/rules` | the mute rules, oldest first, each with its `hits` | owner or member |
+| POST | `/api/mailboxes/:address/rules` | `{field, pattern}` → `{rule, hidden_now}` — creates it and hides what already matches | owner |
+| DELETE | `/api/mailboxes/:address/rules/:id` | deletes the rule; **messages it muted stay muted** | owner |
 | GET | `/api/messages/:id` | the full row, its fan-out log, and `html_rendered` / `remote_images` / `render_note` | owner or member |
 | GET | `/api/messages/:id/raw` | the archived `.eml` straight from R2 | owner or member |
 | POST | `/api/messages/:id/reply` | `{text, cc?}` — reply as the mailbox | owner or member |
+| POST | `/api/messages/:id/hidden` | `{hidden: 0\|1}` — hide or un-hide one message; un-hiding clears `muted_by` | owner |
 
 Anything an identity may not reach is `403`, including a message whose mailbox it is not on.
 `/api/me` and `/api/mailboxes` are identity-scoped reads rather than gated ones: they answer for
@@ -257,7 +315,10 @@ on the contact page — not a mail client, and not a helpdesk.
   governs the lot. Owners and members scope *visibility*, not storage; this is one operator's
   install, not a service with tenants.
 * **No delete.** Deleting a mailbox removes its configuration; its messages and its archive
-  stay.
+  stay. **Muting is not deleting either** — a muted message is stored, readable and
+  downloadable; what stops is the fan-out.
+* **Rules mute and nothing else.** No move, no tag, no auto-reply, no forward-to-one-person, and
+  no regular expressions.
 
 If you want folders, search and threading, you want a webmail, and there are good ones.
 

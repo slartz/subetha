@@ -26,6 +26,11 @@ in one sentence, and every control below exists because of it.
 | A `cid:` image tempting someone to add a fetch route for MIME parts | Parts are inlined as `data:` URIs server-side instead. The sandboxed iframe has an **opaque origin**, so a subresource request from it would not carry the `CF_Authorization` cookie and would 401 — such a route would have to weaken the sandbox to work. |
 | A huge inline image turning one message read into a memory event | 2 MB per image and 6 MB per message. Over either cap the `src` is left as the unresolved `cid:`; over the 20 MB parse cap the archive is not read at all. |
 | One mailbox's member reading another mailbox | `perm.js`, enforced server-side on every route. See *Owners and members*. |
+| A member silencing a mailbox for everybody | Creating or deleting a mute rule, and hiding or un-hiding a message, are **owner-only** — a rule stops the fan-out for every member, not just the one who added it. Asserted by `test/structure.test.mjs`. |
+| SQL injection through a rule pattern | The pattern is **bound**, never interpolated; only the column-and-operator fragment is chosen by the code, from a fixed set of four. `%` and `_` are escaped with a declared `ESCAPE` so a wildcard in a pattern matches itself. |
+| A rule pattern chewing the DO's single thread | **No regular expressions anywhere in a rule.** Two comparisons only — equals and contains — so there is no backtracking to trigger, on a path that runs inside the object while mail arrives. |
+| A rule quietly muting everything | An empty pattern matches nothing rather than everything; an address or domain that could never match is refused at creation; `from_domain` is an exact match, so it cannot widen to a parent domain. Tested. |
+| A rule used as a way to destroy mail | Rules **mute** and nothing else: the raw message is still archived to R2, the row is still stored, and both are still readable. There is no delete in the product and no rule action that approximates one. |
 | A third-party script or font on the admin page | The UI loads **no external resource of any kind**. Everything is inline. |
 | Memory exhaustion from a huge message | Over 20 MB the raw message is streamed straight to R2 and never held in the isolate; the body is not parsed. |
 
@@ -83,6 +88,28 @@ an owner-only field. **Adding a member is granting the right to send as that add
 `OWNERS` unset or left at the shipped `owner@example.com` placeholder means nobody is an owner
 and nothing can be configured — closed in the direction that costs an edit to `wrangler.jsonc`.
 
+### Mute rules are administration
+
+A mute rule is configuration of the same weight as the member list, and it is treated that way.
+
+* **Creating and deleting one is owner-only**, as is hiding or un-hiding a message. A rule stops
+  the fan-out for *every* member of the mailbox: one member muting a sender would silence it for
+  the whole team, and nothing in the mail they no longer receive would say why.
+* **Reading the rules is a view permission**, not an admin one. A member who can see the mailbox
+  can see why its mail is being muted — the alternative is a member watching mail disappear.
+* **Patterns are data, everywhere.** In SQL they are bound parameters; the only thing the code
+  chooses is which of four column expressions to use, and `%`/`_` are escaped with an explicit
+  `ESCAPE` so a wildcard typed into a pattern matches itself. In the UI a pattern is escaped
+  before it is drawn, like every other value that came off a message.
+* **There are no regular expressions**, and this is a security property rather than a taste: the
+  matcher runs inside the Durable Object on the inbound path, where the object's single thread is
+  shared with every other mailbox's mail. Equals and contains cannot backtrack.
+* **A rule cannot destroy anything.** Muting hides a row and stops a fan-out. The archived `.eml`
+  is untouched, the stored row is untouched, and both are one checkbox away in the UI.
+* **A rule is not a security control.** It suppresses delivery; it does not filter spam, does not
+  authenticate anything, and does not stop a message being stored and read. Do not use one as a
+  block list against a determined sender — the address it matches on is one they choose.
+
 ## Authentication
 
 Two paths, both mandatory, evaluated before the router looks at the path:
@@ -124,7 +151,8 @@ shell history, and store it in a secret manager rather than a file.
 The worker logs in JSON to `console`, which means Workers Logs / tail. What it logs:
 
 * **Inbound**: mailbox address, row id, byte size, whether the mailbox was configured, the
-  suppression reason if any, delivered count, failed count.
+  suppression reason if any, the **id** of the mute rule that matched if any, delivered count,
+  failed count. The rule's *pattern* is never logged — a subject pattern is content.
 * **Failures**: the stage (`read`, `decode`, `parse`, `fanout_log`, `archive_failed`), the
   mailbox, the R2 key, and a truncated error string.
 * **Fetch errors**: the pathname and a truncated error string.

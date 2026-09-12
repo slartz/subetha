@@ -22,6 +22,7 @@ import { replyToMessage, composeNew, HttpError } from "./compose.js";
 import { accessOk, accessEmail } from "./access.js";
 import { validAddr } from "./build-mime.js";
 import { canAdmin, canView, parseOwners, visibleMailboxes } from "./perm.js";
+import { normaliseRule, ruleError } from "./rules.js";
 import { inlineParts, renderHtml } from "./html-render.js";
 import { renderUi } from "./ui.js";
 export { MailboxDO } from "./mailbox-do.js";
@@ -140,12 +141,36 @@ export async function route(request, env, ctx) {
       if (!(await mayView(stub, identity, owners, address))) return forbidden();
       const before = Number(url.searchParams.get("before")) || 0;
       const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 100);
-      return json(await stub.messages(address, before, limit));
+      // Muted mail is excluded unless asked for. It is stored, it is not deleted, and
+      // ?hidden=1 is the whole of "show me it anyway".
+      const includeHidden = url.searchParams.get("hidden") === "1";
+      return json(await stub.messages(address, before, limit, includeHidden));
     }
     if (seg.length === 4 && seg[3] === "send" && request.method === "POST") {
       if (!(await mayView(stub, identity, owners, address))) return forbidden();
       const body = await request.json().catch(() => ({}));
       return json(await composeNew(env, stub, address, body, identity));
+    }
+
+    // Rules. Anyone who may see the mailbox may see why its mail is being muted — a member
+    // who cannot is a member wondering where the mail went. Creating and deleting one is
+    // OWNER-ONLY: a mute stops the fan-out for EVERY member, not just for the person adding it.
+    if (seg.length === 4 && seg[3] === "rules" && request.method === "GET") {
+      if (!(await mayView(stub, identity, owners, address))) return forbidden();
+      return json(await stub.rules(address));
+    }
+    if (seg.length === 4 && seg[3] === "rules" && request.method === "POST") {
+      if (!canAdmin(identity, owners)) return forbidden();
+      if (!validAddr(address)) return json({ error: "invalid mailbox address" }, 400);
+      const body = await request.json().catch(() => ({}));
+      const rule = normaliseRule(body?.field, body?.pattern);
+      const bad = ruleError(rule);
+      if (bad) return json({ error: bad }, 400);
+      return json(await stub.addRule(address, rule.field, rule.pattern, identity));
+    }
+    if (seg.length === 5 && seg[3] === "rules" && request.method === "DELETE") {
+      if (!canAdmin(identity, owners)) return forbidden();
+      return json(await stub.deleteRule(address, Number(seg[4]) || 0));
     }
   }
 
@@ -173,6 +198,14 @@ export async function route(request, env, ctx) {
     if (seg.length === 4 && seg[3] === "reply" && request.method === "POST") {
       const body = await request.json().catch(() => ({}));
       return json(await replyToMessage(env, stub, id, body, identity));
+    }
+    // Hiding and un-hiding one message by hand. Owner-only, like the rules it overrides: what
+    // is visible in a shared mailbox is the same question either way, and a member who could
+    // hide a message could hide it from everybody.
+    if (seg.length === 4 && seg[3] === "hidden" && request.method === "POST") {
+      if (!canAdmin(identity, owners)) return forbidden();
+      const body = await request.json().catch(() => ({}));
+      return json(await stub.setHidden(id, body?.hidden ? 1 : 0));
     }
   }
 
