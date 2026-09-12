@@ -235,3 +235,6 @@ quiet mailbox they are watching is quiet or broken.
 ## Reporting a vulnerability
 
 Please report privately via GitHub security advisories, not in a public issue.
+
+### Client-side storage
+The page keeps one key in `localStorage`, `subetha-theme` (`light`/`dark`), read before first paint to apply the optional dark theme. No other client storage; nothing is sent to the server.

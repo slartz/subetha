@@ -23,24 +23,50 @@ const esc = (x) => String(x ?? "").replace(/[&<>"']/g, (c) =>
 const CSP = (img) => `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; ` +
   `img-src ${img}; style-src 'unsafe-inline'; font-src data:">`;
 
+// The tab icon, inline like everything else on this page: an envelope with an arrow leaving it.
+// Two literal colours because a favicon inherits nothing, and percent-encoded because a raw
+// "#" in a data: URI starts a fragment and would cut the document in half. It is deliberately
+// the only icon link on the page — one SVG scales, and a second link is a size negotiation.
+const FAVICON = "%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%235980a6%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Crect%20x%3D%222%22%20y%3D%224%22%20width%3D%2215%22%20height%3D%2211.5%22%20rx%3D%222%22%2F%3E%3Cpath%20d%3D%22M3.5%205.4%209.5%209.9%2015.5%205.4%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke%3D%22%23ffffff%22%20stroke-width%3D%225%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke-width%3D%222.4%22%2F%3E%3C%2Fsvg%3E";
+
 export function renderUi({ identity } = {}) {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SubEtha</title>
+<link rel="icon" href="data:image/svg+xml,${FAVICON}">
+<meta name="theme-color" content="#5980a6">
+<script>
+// The theme is the operator's choice, not the operating system's, and it is read HERE rather
+// than in the script at the foot of the page: by the time that one runs the browser has
+// already painted, and somebody who picked dark would watch the page flash white every load.
+// localStorage throws outright in some privacy modes, so a stored preference is a nicety and
+// never a requirement — the page is light when it cannot be asked.
+try { if (localStorage.getItem("subetha-theme") === "dark") document.documentElement.setAttribute("data-theme", "dark"); } catch (e) {}
+</script>
 <style>${CSS}</style>
 
 <div class="bar">
-  <h1>SubEtha</h1>
-  <span class="who" id="who">${esc(identity || "")}</span>
-  <div class="row">
-    <label class="lbl" for="box">mailbox</label>
-    <select id="box"></select>
-    <button id="newbox">New mailbox…</button>
-    <label class="lbl" for="dn">display name</label>
-    <input type="text" id="dn" class="grow" placeholder="Support" style="max-width:260px">
-    <button id="save" class="primary">Save</button>
-    <button id="del">Delete mailbox</button>
+  <div class="head">
+    <h1>SubEtha</h1>
     <span class="grow"></span>
-    <button id="compose">Compose…</button>
+    <label class="opt"><input type="checkbox" id="dark"> dark</label>
+    <span class="who" id="who">${esc(identity || "")}</span>
+  </div>
+  <div class="row">
+    <span class="grp">
+      <label class="lbl" for="box">mailbox</label>
+      <select id="box"></select>
+    </span>
+    <button id="newbox" class="primary">New mailbox…</button>
+    <span class="grp grow">
+      <label class="lbl" for="dn">display name</label>
+      <input type="text" id="dn" class="grow" placeholder="Support" style="max-width:260px">
+    </span>
+    <span class="grp">
+      <button id="save" class="primary">Save</button>
+      <button id="del">Delete mailbox</button>
+    </span>
+    <span class="grow"></span>
+    <button id="compose" class="primary">Compose…</button>
   </div>
   <table class="members"><tbody id="members"></tbody></table>
   <div class="row">
@@ -70,15 +96,16 @@ export function renderUi({ identity } = {}) {
 <div class="panes">
   <div class="pane">
     <h2>Messages <span id="count" class="note"></span>
-      <label class="note" style="float:right"><input type="checkbox" id="onlyunconf"> unconfigured only</label>
-      <label class="note" style="float:right;margin-right:12px"><input type="checkbox" id="showmuted"> show muted</label>
+      <span class="grow"></span>
+      <label class="opt"><input type="checkbox" id="onlyunconf"> unconfigured only</label>
+      <label class="opt"><input type="checkbox" id="showmuted"> show muted</label>
     </h2>
     <div id="list"></div>
     <div class="body"><button id="more">Load more</button></div>
   </div>
   <div class="pane">
     <h2 id="msgtitle">Nothing selected</h2>
-    <div class="body" id="msg"><p class="note">Pick a message on the left.</p></div>
+    <div class="body" id="msg"><p class="empty">Pick a message on the left.</p></div>
   </div>
 </div>
 
@@ -176,7 +203,7 @@ function memberRow(email, mode, last) {
   var tr = document.createElement("tr");
   tr.className = memberTint(last);
   tr.innerHTML =
-    '<td><input type="email" class="m-email" style="width:260px" value="' + esc(email || "") + '" placeholder="someone@example.com"></td>' +
+    '<td><input type="email" class="m-email" value="' + esc(email || "") + '" placeholder="someone@example.com"></td>' +
     '<td><label><input type="radio" class="m-fwd" name="' + nm + '"' + (mode !== "send" ? " checked" : "") + '> forward</label> ' +
     '<label><input type="radio" class="m-snd" name="' + nm + '"' + (mode === "send" ? " checked" : "") + '> send</label></td>' +
     "<td>" + memberStat(last) + "</td>" +
@@ -335,7 +362,7 @@ async function loadBoxes(keep) {
     sb.appendChild(o);
   }
   if (!boxes.length) {
-    el("list").innerHTML = '<div class="body note">' + (isOwner
+    el("list").innerHTML = '<div class="body empty">' + (isOwner
       ? "No mailbox has received anything yet, and none is configured. Use “New mailbox…”."
       : "No mailboxes. You are not on any mailbox’s member list — ask an owner to add you.") + "</div>";
     cur = null; showConfig(null); await loadRules(); return;
@@ -362,7 +389,7 @@ function renderList() {
   el("count").textContent = shown.length + " shown";
   var host = el("list");
   host.innerHTML = "";
-  if (!shown.length) { host.innerHTML = '<div class="body note">Nothing here.</div>'; return; }
+  if (!shown.length) { host.innerHTML = '<div class="body empty">Nothing here.</div>'; return; }
   for (var i = 0; i < shown.length; i++) {
     (function (m) {
       var b = document.createElement("button");
@@ -374,7 +401,7 @@ function renderList() {
         (m.hidden ? '<span class="badge muted">muted' + (m.muted_by ? " &middot; rule #" + m.muted_by : "") + "</span>" : "") + "</div>" +
         '<div class="l2"><span class="grow">' + esc(m.direction === "out" ? "to " + (m.to_addrs || "") : (m.from_name || m.from_addr || "")) + "</span>" +
         (m.has_attachments ? '<span class="badge">att</span>' : "") + fanoutCell(m) +
-        "<span>" + esc(when(m.received_at, m.date_hdr)) + "</span></div>";
+        '<span class="when">' + esc(when(m.received_at, m.date_hdr)) + "</span></div>";
       b.onclick = function () { openMsg(m.id).catch(function (e) { toast(String(e.message || e)); }); };
       host.appendChild(b);
     })(shown[i]);
@@ -382,7 +409,7 @@ function renderList() {
 }
 async function loadMessages(reset) {
   if (!cur) return;
-  if (reset) { msgs = []; oldest = 0; sel = null; el("msg").innerHTML = '<p class="note">Pick a message on the left.</p>'; el("msgtitle").textContent = "Nothing selected"; }
+  if (reset) { msgs = []; oldest = 0; sel = null; el("msg").innerHTML = '<p class="empty">Pick a message on the left.</p>'; el("msgtitle").textContent = "Nothing selected"; }
   var q = "/api/mailboxes/" + encodeURIComponent(cur) + "/messages?limit=50" + (oldest ? "&before=" + oldest : "") +
           (showMuted ? "&hidden=1" : "");
   var page = await api(q);
@@ -404,7 +431,7 @@ function mutedNote(m) {
 }
 function fanoutTable(f) {
   if (!f || !f.length) return "";
-  var s = '<h3 style="font-size:14px;margin:0 0 4px">Fan-out</h3><table class="kv">';
+  var s = '<h3 class="sec">Fan-out</h3><table class="kv">';
   for (var i = 0; i < f.length; i++) {
     s += '<tr><td class="k">' + esc(f[i].member || "—") + "</td><td>" +
          '<span class="badge' + (f[i].ok ? "" : " bad") + '">' + esc(f[i].mode) + (f[i].ok ? " ok" : " FAILED") + "</span> " +
@@ -450,7 +477,7 @@ function render() {
   // No Reply on an outbound row: the only address to reply to there is the mailbox itself,
   // which would come straight back through Email Routing and be fanned out again.
   var n = m.remote_images || 0;
-  var buttons = '<div class="row">' +
+  var buttons = '<div class="row actions">' +
     (m.direction === "out" ? "" : '<button id="breply">Reply</button>') +
     (m.html ? '<button id="bhtml">' + (showHtml ? "Show text" : "Show HTML") + "</button>" : "") +
     (showHtml && !loadRemote && n ? '<button id="bremote">Load ' + n + " remote image" + (n === 1 ? "" : "s") + "</button>" : "") +
@@ -547,7 +574,7 @@ function muteModal() {
 function replyBox() {
   var m = sel;
   el("replybox").innerHTML =
-    '<h3 style="font-size:14px;margin:8px 0 4px">Reply as ' + esc(m.mailbox) + "</h3>" +
+    '<h3 class="sec">Reply as ' + esc(m.mailbox) + "</h3>" +
     '<div class="row"><label class="lbl">cc</label><input type="text" id="rcc" class="grow" placeholder="optional, comma separated"></div>' +
     '<textarea id="rtext" placeholder="Your reply. The original is quoted underneath automatically."></textarea>' +
     '<div class="row"><button id="rsend" class="primary">Send reply</button><span class="err" id="rerr"></span></div>';
@@ -589,6 +616,15 @@ function composeModal() {
 }
 
 // ---- wiring ------------------------------------------------------------
+// A page preference, not mailbox configuration: it never goes near the server, it belongs to
+// this browser alone, and the attribute it sets is the ONLY thing that makes the page dark.
+el("dark").checked = document.documentElement.getAttribute("data-theme") === "dark";
+el("dark").onchange = function () {
+  var on = el("dark").checked;
+  if (on) document.documentElement.setAttribute("data-theme", "dark");
+  else document.documentElement.removeAttribute("data-theme");
+  try { localStorage.setItem("subetha-theme", on ? "dark" : "light"); } catch (e) {}
+};
 el("box").onchange = async function () { cur = el("box").value; showConfig(boxes.filter(function (b) { return b.address === cur; })[0]); await loadRules(); await loadMessages(true); };
 el("addmember").onclick = function () { el("members").appendChild(memberRow("", "forward")); };
 el("onlyunconf").onchange = renderList;
