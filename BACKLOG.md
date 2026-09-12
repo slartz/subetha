@@ -5,7 +5,7 @@
 - [x] First mailbox configured, routing repointed, real mail stored + forwarded, reply from the UI delivered; three members (two forward, one send) all `ok`.
 - [x] HTML by default; inline `cid:` images; HTML quotes in replies; owners/members; per-member delivery status; send-mode sender attribution; Rules v1 (mute). 128 tests. First schema migration verified on live data.
 - [x] `GET /api/health` (watched by the operator's monitor); `GET /api/export` + daily `_config/` snapshot to R2; storage counter, one-shot purge with dry-run, standing `retention_days`; loop-guard corrections. 159 tests. Live 2026-09-13.
-- [ ] In progress: design pass — "pleasing, comfortable, fine", not a redesign — and an inline-SVG favicon (envelope with a forward arrow, legible at 16px).
+- [x] Design pass ("pleasing, comfortable, fine"), inline-SVG favicon, dark mode opt-in only. Live 2026-09-13.
 - [ ] Publish decision: flip the GitHub repo public once the README reads right; keep Issues/PRs enabled.
 - [ ] Operators embedding this in a private infrastructure repo: keep your real `wrangler` config **outside** the copy/subtree so upstream merges never conflict on vars.
 
