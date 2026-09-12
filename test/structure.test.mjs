@@ -59,6 +59,26 @@ test("index.js calls handleInbound and nothing else from email()", () => {
       `${f} calls setReject — a reject is a bounce, and bounce rate is one of the four dials governing the sending quota`);
 });
 
+test("compose.js is NOT reachable from the scheduled() path either", () => {
+  // A cron is an unauthenticated caller in every sense that matters: nobody is behind it,
+  // nothing checked a JWT, and it fires whether or not anyone is watching. So the daily run
+  // sits behind the same wall email() does — it reads the DO and writes R2, and the
+  // send-to-anyone capability is not in its import graph.
+  const graph = reachable("scheduled.js");
+  for (const f of ["compose.js", "send.js"])
+    assert.equal(graph.has(f), false,
+      `scheduled.js can reach ${f} via ${[...graph].join(", ")} — a cron can now send mail`);
+});
+
+test("scheduled() hands off to scheduled.js and names nothing else", () => {
+  const s = code("index.js");
+  const body = s.slice(s.indexOf("async scheduled(event, env, ctx)"), s.indexOf("export async function route"));
+  assert.match(body, /runScheduled\(env, stub, event\?\.scheduledTime \|\| Date\.now\(\)\)/);
+  assert.equal(/replyToMessage|composeNew|sendRaw|env\.SEND/.test(body), false,
+    "scheduled() must not name the send path at all");
+  assert.match(body, /try \{/, "a throw out of scheduled() is a failed run with nobody to tell");
+});
+
 test("compose.js is imported by index.js and by nothing else", () => {
   const importers = files.filter((f) => importsOf(f).includes("compose.js"));
   assert.deepEqual(importers, ["index.js"]);
@@ -124,10 +144,92 @@ test("every mutating mailbox route checks the admin permission before it mutates
 test("every mailbox route that is not mutating checks the view permission", () => {
   const s = code("index.js");
   for (const [route, act] of [
+    ['seg.length === 3 && request.method === "GET"', "stub.mailbox("],
     ['seg[3] === "messages" && request.method === "GET"', "stub.messages("],
     ['seg[3] === "send" && request.method === "POST"', "composeNew(env, stub, address"],
   ]) assert.match(between(s, route, act), /mayView\(stub, identity, owners, address\)/,
     `${act} is reachable without the view check`);
+});
+
+test("deleting mail is owner-only, and there is exactly one thing that deletes it", () => {
+  // SubEtha had no delete at all until retention; the promise that replaced "nothing is ever
+  // deleted" is "one route deletes, an owner asks for it by name, and it says what it took".
+  const s = code("index.js");
+  assert.equal(count(s, "purgeOlderThan(env, stub"), 1, "exactly one call site to guard");
+  assert.match(between(s, 'seg[3] === "purge" && request.method === "POST"', "purgeOlderThan(env, stub"),
+    /canAdmin\(identity, owners\)/,
+    "the purge route is reachable without the admin check — a member could destroy the history");
+  // The period is one of a fixed set, not a number: "1" is a plausible slip for "365".
+  assert.match(between(s, 'seg[3] === "purge" && request.method === "POST"', "purgeOlderThan(env, stub"),
+    /purgeDays\(body\?\.older_than_days\)/);
+  const doCode = code("mailbox-do.js");
+  assert.equal(count(doCode, "DELETE FROM messages"), 1,
+    "exactly one statement removes stored mail, and it is the purge's");
+  assert.match(between(doCode, "purgeRows(address, ids)", "DELETE FROM messages"),
+    /DELETE FROM fanout_log/,
+    "the fan-out rows must go first — a fanout_log row whose message is gone is an orphan");
+});
+
+test("the health route answers any authenticated identity, and nothing else does the deriving", () => {
+  const s = code("index.js");
+  const auth = s.indexOf('if (!identity) return json({ error: "unauthorized" }, 401);');
+  const route = s.indexOf('path === "/api/health"');
+  assert.ok(route > auth, "the health route must sit below the auth gate like every other route");
+  // Deliberately NOT owner-only: the counts leak nothing but counts, and a member watching a
+  // quiet mailbox needs to tell "nothing arrived" from "nothing works".
+  assert.match(between(s, 'path === "/api/health"', "stub.health()"), /^[^\n]*shapeHealth/,
+    "the health route must answer on the same line it is matched on, with no permission branch");
+  assert.equal(count(s, "stub.health()"), 1);
+  assert.equal(count(s, "shapeHealth(await stub.health())"), 1,
+    "ok/degraded is derived in one place, from the one read-only call");
+});
+
+test("the config export is owner-only and is the same document the snapshot writes", () => {
+  const s = code("index.js");
+  assert.match(between(s, 'path === "/api/export"', "stub.exportConfig()"), /canAdmin\(identity, owners\)/,
+    "the export is every mailbox, every member address and every rule in one response");
+  // One method, two callers: the file in the bucket and the file behind the route cannot drift.
+  const callers = files.filter((f) => /stub\.exportConfig\(\)/.test(code(f)));
+  assert.deepEqual(callers.sort(), ["index.js", "scheduled.js"]);
+  assert.equal(/messages|text|html|attachments/.test(
+    between(code("mailbox-do.js"), "exportConfig()", "purgePreview(address, cutoff)")), false,
+    "an export carries configuration and no mail");
+});
+
+test("the schema migration is additive, PRAGMA-guarded, and inside blockConcurrencyWhile", () => {
+  // The object is LIVE while this runs. An ALTER that throws is a constructor that fails on
+  // every RPC afterwards, which on this path means mail arriving at a DO that cannot start.
+  const s = code("mailbox-do.js");
+  const block = between(s, "ctx.blockConcurrencyWhile(async () => {", "#rows(sql, ...args)");
+  assert.equal(count(s, "ALTER TABLE"), 1, "one place adds columns, and it is the guarded one");
+  assert.ok(block.includes("ALTER TABLE"), "the migration must run inside blockConcurrencyWhile");
+  assert.match(block, /PRAGMA table_info\(\$\{table\}\)/);
+  assert.match(block, /if \(!have\.has\(name\)\) this\.sql\.exec\(`ALTER TABLE \$\{table\} ADD COLUMN/,
+    "every ALTER must be skipped when its column is already there");
+  for (const destructive of ["DROP COLUMN", "DROP TABLE", "RENAME TO", "RENAME COLUMN"])
+    assert.equal(s.includes(destructive), false, `${destructive} is not an additive migration`);
+  // Every migrated column is in the CREATE too, so a new object and an old one converge.
+  const create = between(block, "CREATE TABLE IF NOT EXISTS mailboxes", "const columns = (table)");
+  const migration = block.slice(block.indexOf("const columns = (table)"));
+  for (const col of ["list_id", "hidden", "muted_by", "retention_days"]) {
+    assert.ok(create.includes(col), `${col} is missing from the CREATE — a new object would not have it`);
+    assert.ok(migration.includes(col), `${col} is missing from the migration — an existing object would not gain it`);
+  }
+  // A retention column with a default would start deleting on deploy. It has none, and null
+  // means keep forever.
+  assert.match(migration, /\["retention_days", "retention_days INTEGER"\]/);
+});
+
+test("a send-mode fan-out copy is marked machine-generated, and a human's reply is not", () => {
+  // The fan-out is a machine re-sending somebody else's mail: a vacation autoresponder on the
+  // far side must not answer it, and if the copy ever comes back through Email Routing the
+  // loop guard stops it on this header alone.
+  const s = code("inbound.js");
+  assert.match(s, /"Auto-Submitted": "auto-replied"/);
+  assert.match(between(s, "buildMime({", "X-Subetha-Original-From"), /"Auto-Submitted": "auto-replied"/,
+    "the mark belongs on the built copy, beside the hop header");
+  assert.equal(/Auto-Submitted/i.test(code("compose.js")), false,
+    "a reply and a compose are written by a person — marking them auto-replied tells the recipient's mail system to ignore a human");
 });
 
 test("the message routes resolve the row and ask about ITS mailbox before answering", () => {

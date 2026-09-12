@@ -16,10 +16,11 @@ false, the tests fail, and that is the tests working.
    bounce tells the sender the address is broken. Every fallible step in the inbound path is
    already wrapped; keep it that way. A message that cannot be parsed is still archived, still
    stored, and still visible.
-2. **`compose.js` must stay unreachable from `email()`.** `inbound.js` must not import it,
-   directly or transitively. This is the compensating control for a `send_email` binding with
-   no `allowed_destination_addresses`. Any change to `inbound.js`'s imports is a change to
-   that binding's blast radius — treat it as a security change.
+2. **`compose.js` must stay unreachable from `email()` — and from `scheduled()`.** `inbound.js`
+   must not import it, directly or transitively, and neither must `scheduled.js`: a cron fires with
+   nobody behind it and nothing having checked a JWT. This is the compensating control for a
+   `send_email` binding with no `allowed_destination_addresses`. Any change to either module's
+   imports is a change to that binding's blast radius — treat it as a security change.
 
 ## Hard rules
 
@@ -37,7 +38,13 @@ false, the tests fail, and that is the tests working.
   `mailbox-do.js`, `cloudflare:email` in `send.js`. Such an import makes a module untestable
   under Node, so keep logic worth asserting in a module that has none. Asserted.
 * **The Durable Object does state and nothing else.** It never sends, never forwards, never
-  waits on the network. Its thread is shared by every mailbox.
+  waits on the network — including in a purge, where the R2 deletes happen in the worker and the
+  object only hands out rows and forgets them. Its thread is shared by every mailbox.
+* **A schema change is additive and PRAGMA-guarded**, in the same `blockConcurrencyWhile` as the
+  original DDL, and the column goes in the `CREATE TABLE` too. Asserted. A new column that deletes
+  anything by default is not additive, whatever the DDL says.
+* **Nothing but the purge deletes a message.** `DELETE FROM messages` has exactly one call site and
+  it is reachable only from an owner-only route and the retention sweep. Asserted.
 * **Every header value goes through `headerValue()` and every address through `validAddr()`.**
   Do not build a header line by concatenation.
 * **Never log a message body, a subject, a secret, or a token.** See `SECURITY.md`.
@@ -48,7 +55,7 @@ false, the tests fail, and that is the tests working.
 node --test test/*.test.mjs
 ```
 
-**Must be 128/128 before you open a PR**, and a PR that changes behaviour adds tests. See
+**Must be 159/159 before you open a PR**, and a PR that changes behaviour adds tests. See
 `TESTS.md` for what each file covers and what is deliberately not covered.
 
 Note that `test/build-mime.test.mjs` contains a literal NUL byte in one fixture — it is meant
@@ -58,9 +65,10 @@ to be there, and it means `grep -r` skips that file as binary. Do not "fix" it.
 
 **The non-goals in `REQUIREMENTS.md` are non-goals, not a backlog.** No folders, no search, no
 threading view, no read state, no rich compose, no attachment extraction, no multi-tenancy.
-This is a shared mailbox for casual addresses, and staying under 2,000 lines with no
-dependencies is the feature. A PR that adds one of those will be declined, however good it is
-— fork instead, and enjoy it.
+This is a shared mailbox for casual addresses. Small is the feature: no build step, no framework,
+no dependencies, and every module readable in one sitting. Line count is a symptom, not the rule —
+but if it needs a build step or a framework to grow, it has grown wrong. A PR that adds one of
+those non-goals will be declined, however good it is — fork instead, and enjoy it.
 
 Bug fixes, portability fixes, clearer documentation, and tests for what is currently untested
 are all welcome.

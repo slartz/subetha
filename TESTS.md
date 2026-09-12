@@ -10,7 +10,7 @@ From the project root, with any Node that has `node:test` (18+). **No dependenci
 to install** — `node:test`, `node:assert/strict`, `node:fs`, `node:path`, `node:url` and
 nothing else. There is no test runner, no config file, and no build step.
 
-Expected: **128 tests, 128 pass, 0 fail.**
+Expected: **159 tests, 159 pass, 0 fail.**
 
 Run one file while working on it:
 
@@ -22,15 +22,17 @@ node --test test/build-mime.test.mjs
 
 | file | tests | covers |
 |---|---|---|
-| `test/build-mime.test.mjs` | 25 | the RFC 5322 builder, and the send-mode copy's sender |
 | `test/html-render.test.mjs` | 26 | the reader's HTML pass and the reply quote |
+| `test/build-mime.test.mjs` | 25 | the RFC 5322 builder, and the send-mode copy's sender |
+| `test/structure.test.mjs` | 21 | the structural invariants — read on |
+| `test/loop-guard.test.mjs` | 14 | both loop predicates, including the branches that must NOT fire |
 | `test/fanout-status.test.mjs` | 13 | the delivery-error classifier and the member-row shaping |
 | `test/parse-mail.test.mjs` | 13 | the body parser and the one text derivation |
 | `test/rules.test.mjs` | 11 | mute-rule matching, and the same rule as SQL |
-| `test/loop-guard.test.mjs` | 10 | both loop predicates, including the branches that must NOT fire |
+| `test/health.test.mjs` | 10 | the health document, `ok`, and the degraded sentences |
 | `test/perm.test.mjs` | 10 | the permission predicate: owner, member, stranger, bearer |
-| `test/archive.test.mjs` | 6 | the R2 key shape and its sanitising |
-| `test/structure.test.mjs` | 14 | the structural invariants — read on |
+| `test/archive.test.mjs` | 8 | the R2 key shape, its sanitising, and the config-snapshot prefix |
+| `test/retention.test.mjs` | 8 | the purge period set, the cutoff, the selection predicate, the summaries |
 
 **`build-mime.test.mjs`** — two of these are security tests and the rest correctness. Header
 injection through the Subject and through the display name is neutralised; an invalid address
@@ -118,13 +120,53 @@ makes an *unanchored* header lookup return garbage and silently eat the body. If
 `Precedence` (bulk/junk/list and nothing else), `X-Subetha-Hop` outranking everything, an
 ordinary message not being suppressed, a plain object read as happily as a `Headers`, and
 **`List-Id` deliberately not being a guard** — asserted so the omission reads as a decision.
+Then the two pre-RFC spellings: `X-Autoreply` and `X-Autorespond` suppressing on **any** value,
+an empty value reading as absent exactly as `X-Subetha-Hop` does, and `Auto-Submitted` being named
+before them when a message carries both. Then the test that pins the design — **"do not auto-reply
+to me" is NOT "do not forward me"**: `X-Auto-Response-Suppress` does **not** suppress (Exchange puts
+it on ordinary notification mail), and neither does any of the eight machine local parts
+(`mailer-daemon@`, `no-reply@`, `bounces@`, … including the bracketed and
+`MAILER-DAEMON@mx… (Mail Delivery System)` shapes), because that is exactly the mail a shared
+address exists to receive and forwarding it to a person cannot loop. Both were implemented and
+removed, so they are asserted as omissions rather than left as gaps — alongside a bounce that
+*does* mark itself still being stopped, by its mark rather than by its address. Finally, a send-mode
+fan-out copy's own headers fed back through the guard, so the loop is asserted closed from both
+ends: `X-Subetha-Hop` alone stops it, and `Auto-Submitted: auto-replied` alone stops it too.
 Member level: self, case-insensitivity, routed domains from a parsed set and from the raw var,
 the empty member, and `parseDomains` normalisation.
 
 **`archive.test.mjs`** — the `mailbox/YYYY/MM/message-id.eml` shape, zero-padded months in
 UTC, path traversal and other surprises in a Message-ID being neutralised, a message with no
 usable Message-ID still getting a unique key, an absurdly long Message-ID truncated rather than
-rejected, and `keySafe` keeping exactly what an address needs.
+rejected, and `keySafe` keeping exactly what an address needs. Then the config snapshot's corner of
+the same bucket: `configKey` dated in UTC (a snapshot taken late on the 31st is named for the 31st
+wherever the operator is), `latest.json` stable, and **no mailbox key able to land under the
+`_config/` prefix** — `_config`, `_config@example.com`, `_config/2026-09-12.json` and `../_config`
+all asserted, because sharing the bucket is only safe while that prefix is exclusive.
+
+**`health.test.mjs`** — the contract, field by field and in order, because another system is built
+against it: the exact document, the exact key list, and `fanout_failure_members` (which carries
+member addresses) **not** being in it. Then the judgement: **quiet is not degraded** — no inbound,
+no outbound, an empty install, all `ok: true` with `last_inbound_at: null` rather than `0`; an
+unconfigured message and a muted message being a to-do and a decision rather than failures; `ok:
+false` for a fan-out failure and for an archive failure, with the exact degraded sentences and their
+singular and plural forms; both at once listing both, fan-out first; the fan-out line naming how
+many members and which distinct kinds, each once, in the order the DO returned them, and **never an
+address**; a failure count with no member rows still saying so, because the count is the authority;
+and nothing in the document ever being `undefined`, whatever the DO left out.
+
+**`retention.test.mjs`** — the one thing in SubEtha that deletes mail, so every test is a way it
+could take more than the owner meant. The periods as a fixed set with `0`, `1`, `7`, `45`, `364`,
+`-30`, `30.5`, `Infinity` and `NaN` all refused rather than rounded; a period from a form arriving as
+a string and still having to be one of the five, while `[30]`, `{valueOf: () => 30}` and `true` —
+all of which `Number()` says `30` to — are refused; **retention absent meaning keep forever**, which
+is the safe direction on a route that posts the whole configuration; the cutoff arithmetic; and the
+selection predicate itself — the constant the DO interpolates, asserted to bind both values, to be
+strictly `<` so a message on the boundary is kept, to name no direction, and to ask about age and
+nothing else. Then the shaping: what a purge did counted from the rows that actually went, a row
+whose R2 delete failed being absent from that list and present in `r2_failed`, a row with no stored
+size counting as a row and not as `NaN`, and a dry run carrying `dry_run: true` while a real purge
+does not.
 
 ## The structural invariants
 
@@ -171,6 +213,39 @@ And, since the permission model is only as good as the routes that ask it:
     and `stub.rules` sits behind the view check, because a member who cannot see the rules is a
     member wondering where the mail went.
 
+And the four added with the health check, the snapshot and retention:
+
+15. **`compose.js` is not reachable from `scheduled()` either** — the import graph is walked from
+    `scheduled.js`; neither `compose.js` nor `send.js` may appear. A cron fires with nobody behind
+    it and nothing having checked a JWT, so it sits behind the same wall `email()` does. Plus:
+    `scheduled()` hands off to `runScheduled` and names none of the send path, and it is wrapped in
+    a `try`.
+16. **Deleting mail is owner-only and there is exactly one thing that deletes it** —
+    `purgeOlderThan(env, stub` has one call site with `canAdmin` above it and takes its period
+    through `purgeDays(...)`; `DELETE FROM messages` has exactly **one** call site in
+    `mailbox-do.js`; and inside `purgeRows` the `fanout_log` delete comes before the `messages`
+    delete, because a fan-out row whose message is gone is an orphan nothing can explain.
+17. **The health route is not special-cased** — it is matched below the auth gate, it answers on the
+    same line it is matched on (so there is no permission branch to drift), `stub.health()` has one
+    call site, and `shapeHealth(await stub.health())` appears exactly once, so `ok`/`degraded` is
+    derived in one place. The export route, by contrast, **is** guarded: `canAdmin` between its
+    branch and `stub.exportConfig()`, whose only two callers are `index.js` and `scheduled.js` — one
+    document, so the file in the bucket and the file behind the route cannot drift — and its DO
+    method names no message column.
+18. **The migration is additive, PRAGMA-guarded and inside `blockConcurrencyWhile`** — exactly one
+    `ALTER TABLE` in the file, inside the concurrency block, guarded by `if (!have.has(name))` off a
+    `PRAGMA table_info(${table})` read; no `DROP COLUMN`, `DROP TABLE`, `RENAME TO` or
+    `RENAME COLUMN` anywhere; every migrated column (`list_id`, `hidden`, `muted_by`,
+    `retention_days`) present in **both** the `CREATE TABLE` and the migration list, so a new object
+    and an existing one converge; and `retention_days` declared with no default, because a default
+    would start deleting mail on deploy.
+
+Also structural, and about mail rather than modules:
+
+19. **A send-mode fan-out copy is marked machine-generated and a human's reply is not** —
+    `Auto-Submitted: auto-replied` appears in `inbound.js` beside the hop header on the built copy,
+    and the string appears nowhere in `compose.js`.
+
 If you change the module layout, these are the tests that will fail first, and they are
 supposed to.
 
@@ -184,11 +259,23 @@ Be honest about the shape of the hole:
   key shape are each pure and tested directly), never end to end.
 * **The Durable Object is never instantiated.** No SQLite, no `blockConcurrencyWhile`, no RPC.
   The schema and the queries in `mailbox-do.js` are unverified by tests — including the
-  **migration** (the `PRAGMA table_info` guard and the three `ALTER TABLE ADD COLUMN`s), the
-  `memberStatus` join, and the retroactive `UPDATE` that a new rule runs. What *can* be tested
-  of those is: the predicate the UPDATE interpolates (`sqlPredicate`, in `rules.test.mjs`) and
-  the shaping of what the queries return (`fanout-status.test.mjs`). The statements themselves
-  are held by review and by the smoke test below.
+  **migration** (the `PRAGMA table_info` guards and the `ALTER TABLE ADD COLUMN`s), the
+  `memberStatus` join, the retroactive `UPDATE` that a new rule runs, the nine aggregates in
+  `health()`, the `exportConfig()` projection, the storage sub-selects, and the three purge
+  statements. What *can* be tested of those is: the predicates they interpolate (`sqlPredicate` in
+  `rules.test.mjs`, `PURGE_WHERE` in `retention.test.mjs`), the shaping of what they return
+  (`fanout-status.test.mjs`, `health.test.mjs`, `retention.test.mjs`), and their **structure** —
+  `structure.test.mjs` reads the file and asserts the migration's shape and that exactly one
+  statement deletes a message. The statements themselves are held by review and by the smoke test
+  below.
+* **`scheduled()` is never executed.** There is no cron in the suite, no `ScheduledEvent`, and no
+  R2, so neither the snapshot write nor the retention sweep runs. What is verified is structural
+  (the import graph, the hand-off, the wrapping) and by parts (`configKey`, the period set, the
+  cutoff, the predicate, the summaries). The order R2 and the rows are deleted in — the one thing
+  that decides whether a failure leaves an orphan — is asserted only as the order of two statements
+  in `purgeRows` and by reading `purge.js`.
+* **No purge against a real bucket.** `env.MAIL.delete` is never called, so the `r2_failed` path is
+  exercised by reading it and by the smoke test, not by a test.
 * **No R2.** `archive()` itself is not exercised; only the pure `r2Key`/`keySafe` are.
 * **No Access verification.** `access.js` is not tested — no JWT fixtures, no key fetch.
 * **No HTTP routing.** `route()` is read by `structure.test.mjs` but never called; status
@@ -266,7 +353,31 @@ and after any change to the inbound path.
    should be read-only, and they should still be able to open, reply and compose. Then try
    `GET /api/mailboxes/<another-mailbox>/messages` by hand and confirm it is `403`. Sign in as
    somebody on no list at all and confirm the page loads, says so, and 403s everything else.
-10. Only now add the other members.
+10. **Check the health route.** `curl -H "Authorization: Bearer $ADMIN_SECRET" https://<host>/api/health`
+    — it should answer `ok: true` with `inbound_24h` matching what you have just sent and
+    `degraded: []`. Then ask for it with **no** credential at all and confirm it is `401`: there is
+    no unauthenticated route here and a health check is the one somebody eventually opens up. Sign
+    in as the member from step 9 and confirm they get the same document rather than a 403.
+    * With the unverified `forward` member from step 4 still failing, send one more message and
+      confirm `ok` turns **false** with `fanout_failures_24h` and a `degraded` line naming the count
+      and the kind — and that the line contains no address.
+11. **Check the export and the snapshot.** `GET /api/export` as the owner should return every
+    mailbox with its members and rules and **no messages**; as the member from step 9 it must be
+    `403`. Then either wait for 03:17 UTC or run the trigger by hand
+    (`wrangler dev --test-scheduled` and `curl "http://localhost:8787/__scheduled"`), and confirm
+    `_config/latest.json` and `_config/<today>.json` exist in the bucket with the same document, and
+    that no mailbox's keys have landed under `_config/`.
+12. **Check storage and retention, on a mailbox you do not mind emptying.** The owner panel should
+    show `N messages · X MB · oldest <date>`; a member should see none of that row. Press **Delete
+    older than…**, pick a period, and confirm the confirm states a count that matches what you
+    expect — cancel it once, and confirm nothing was deleted. Then run it for real and confirm the
+    answer's `deleted`/`bytes`, that the rows are gone from the list, and that
+    `GET /api/messages/<id>/raw` for one of them is now `404` (the R2 object went too). Finally set
+    **Retention** to a period, save, reload, and confirm it comes back selected — then that the
+    daily run logs `stage: "retention"` with the counts it removed.
+    * Try `POST …/purge {"older_than_days": 45}` by hand and confirm `400`; try it as the member
+      from step 9 and confirm `403`.
+13. Only now add the other members.
 
 If step 3 works but step 4 does not, the problem is sending, not receiving — check that the
 destination is a verified destination address (for `forward`) or that the zone is onboarded to

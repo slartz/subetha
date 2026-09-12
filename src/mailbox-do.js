@@ -12,6 +12,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { withMemberStatus } from "./fanout-status.js";
 import { firstMatch, sqlPredicate } from "./rules.js";
+import { HEALTH_WINDOW_MS } from "./health.js";
+import { PURGE_WHERE } from "./retention.js";
 
 const now = () => Date.now();
 
@@ -22,7 +24,8 @@ export class MailboxDO extends DurableObject {
     // Idempotent, and inside blockConcurrencyWhile so no RPC can reach a half-built schema.
     ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS mailboxes (
-        address TEXT PRIMARY KEY, display_name TEXT, created_at INTEGER)`);
+        address TEXT PRIMARY KEY, display_name TEXT, created_at INTEGER,
+        retention_days INTEGER)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS members (
         mailbox TEXT, email TEXT, mode TEXT CHECK(mode IN ('forward','send')),
         added_at INTEGER, PRIMARY KEY (mailbox, email))`);
@@ -49,18 +52,29 @@ export class MailboxDO extends DurableObject {
         created_by TEXT, created_at INTEGER, hits INTEGER NOT NULL DEFAULT 0)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS rules_box ON rules(mailbox)`);
 
-      // MIGRATION. The three columns above are in the CREATE for a new object; an object that
+      // MIGRATION. The added columns above are in the CREATE for a new object; an object that
       // already holds mail was created without them, and this brings it to the same shape.
       // Additive only, and guarded by PRAGMA rather than by a version number — ADD COLUMN on a
       // column that exists throws, and a throw in here is a constructor that fails on every
       // RPC afterwards, which on this path means mail arriving at a Durable Object that cannot
       // start. There is no migration window: the object is live the whole time.
-      const have = new Set(this.sql.exec("PRAGMA table_info(messages)").toArray().map((c) => c.name));
-      for (const [name, ddl] of [
-        ["list_id", "list_id TEXT"],
-        ["hidden", "hidden INTEGER NOT NULL DEFAULT 0"],
-        ["muted_by", "muted_by INTEGER"],
-      ]) if (!have.has(name)) this.sql.exec(`ALTER TABLE messages ADD COLUMN ${ddl}`);
+      const columns = (table) =>
+        new Set(this.sql.exec(`PRAGMA table_info(${table})`).toArray().map((c) => c.name));
+      for (const [table, added] of [
+        ["messages", [
+          ["list_id", "list_id TEXT"],
+          ["hidden", "hidden INTEGER NOT NULL DEFAULT 0"],
+          ["muted_by", "muted_by INTEGER"],
+        ]],
+        // Nullable and with no default, because the default IS null: a mailbox that has never
+        // been told otherwise keeps its mail forever, which is what every mailbox did before
+        // this column existed. A migration must not start deleting anything.
+        ["mailboxes", [["retention_days", "retention_days INTEGER"]]],
+      ]) {
+        const have = columns(table);
+        for (const [name, ddl] of added)
+          if (!have.has(name)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+      }
     });
   }
 
@@ -79,31 +93,57 @@ export class MailboxDO extends DurableObject {
   // that only have a rule. An address the routing rule points here but nobody has configured
   // has no mailboxes row at all, so listing the table alone would hide exactly the thing the
   // operator needs to see — and a mailbox muted before it was configured is the same case.
-  mailboxes() {
+  // `storage_bytes` and `storage_oldest_at` are what this mailbox is costing, in the two numbers
+  // an owner acts on: the bytes it holds and the age of the oldest thing in it. Both directions,
+  // because both are stored and both are purged together. They are folded into one `storage`
+  // object below rather than left flat, so the retention UI reads one thing.
+  mailboxes(only) {
+    const one = String(only ?? "");
     return this.#rows(`
       SELECT a.address AS address,
              m.display_name AS display_name,
              m.created_at AS created_at,
+             m.retention_days AS retention_days,
              (m.address IS NOT NULL) AS configured,
              (SELECT COUNT(*) FROM members WHERE mailbox = a.address) AS member_count,
              (SELECT COUNT(*) FROM messages WHERE mailbox = a.address) AS message_count,
              (SELECT COUNT(*) FROM messages WHERE mailbox = a.address AND unconfigured = 1) AS unconfigured_count,
              (SELECT COUNT(*) FROM rules WHERE mailbox = a.address) AS rule_count,
-             (SELECT COUNT(*) FROM messages WHERE mailbox = a.address AND hidden = 1) AS muted_count
+             (SELECT COUNT(*) FROM messages WHERE mailbox = a.address AND hidden = 1) AS muted_count,
+             (SELECT COALESCE(SUM(size), 0) FROM messages WHERE mailbox = a.address) AS storage_bytes,
+             (SELECT MIN(received_at) FROM messages WHERE mailbox = a.address) AS storage_oldest_at
       FROM (SELECT address FROM mailboxes
             UNION SELECT mailbox AS address FROM messages
             UNION SELECT mailbox AS address FROM rules) a
       LEFT JOIN mailboxes m ON m.address = a.address
-      ORDER BY a.address`)
+      ${one ? "WHERE a.address = ?" : ""}
+      ORDER BY a.address`, ...(one ? [one] : []))
       // The editor needs the member list, not just its size, and a shared mailbox has a
       // handful of them — cheaper than a second round trip per mailbox from the browser.
       // Same for each member's last delivery: a forward to an address that is not a verified
       // destination fails on every message, quietly, and the member row is where that belongs.
-      .map((r) => withMemberStatus({
+      .map(({ storage_bytes, storage_oldest_at, ...r }) => withMemberStatus({
         ...r,
+        storage: {
+          messages: Number(r.message_count) || 0,
+          bytes: Number(storage_bytes) || 0,
+          oldest_at: storage_oldest_at == null ? null : Number(storage_oldest_at),
+        },
         members: this.#rows("SELECT email, mode FROM members WHERE mailbox=? ORDER BY email", r.address),
         member_status: this.memberStatus(r.address),
       }));
+  }
+
+  /**
+   * One mailbox in the shape the list uses — the same query with a WHERE, so a row cannot mean
+   * one thing in the list and another on its own. Null for an address that has no configuration,
+   * no stored mail and no rules; there is nothing to say about it and saying it would confirm
+   * which addresses exist to anybody who can guess one.
+   */
+  mailbox(address) {
+    // An empty address must not fall through to "every mailbox" and hand back the first one.
+    const one = String(address ?? "").trim();
+    return one ? this.mailboxes(one)[0] ?? null : null;
   }
 
   // The latest fan-out attempt per member of this mailbox. Read-only, and no new table: the
@@ -130,11 +170,17 @@ export class MailboxDO extends DurableObject {
 
   // Members are REPLACED, not merged: the editor posts the whole list, so a row missing
   // from it is a removal. Merging would make removing a member impossible from the UI.
-  upsertMailbox(address, display_name, members) {
+  //
+  // retention_days follows the same rule and therefore defaults to null — "keep forever" — when
+  // the caller says nothing about it. That is the safe direction on a whole-config PUT: a client
+  // that has never heard of retention turns a standing deletion OFF rather than leaving one
+  // running that it cannot see.
+  upsertMailbox(address, display_name, members, retention_days) {
     this.sql.exec(
-      `INSERT INTO mailboxes(address, display_name, created_at) VALUES(?,?,?)
-       ON CONFLICT(address) DO UPDATE SET display_name=excluded.display_name`,
-      address, display_name ?? null, now());
+      `INSERT INTO mailboxes(address, display_name, created_at, retention_days) VALUES(?,?,?,?)
+       ON CONFLICT(address) DO UPDATE SET display_name=excluded.display_name,
+                                          retention_days=excluded.retention_days`,
+      address, display_name ?? null, now(), retention_days ?? null);
     this.sql.exec("DELETE FROM members WHERE mailbox=?", address);
     for (const m of members || [])
       this.sql.exec("INSERT OR REPLACE INTO members(mailbox,email,mode,added_at) VALUES(?,?,?,?)",
@@ -204,6 +250,139 @@ export class MailboxDO extends DurableObject {
     this.sql.exec("DELETE FROM members WHERE mailbox=?", address);
     const r = this.sql.exec("DELETE FROM mailboxes WHERE address=?", address);
     return { deleted: address, removed: r.rowsWritten, messages_kept: true };
+  }
+
+  // ---------- health and export ----------
+
+  /**
+   * Everything GET /api/health reports, in ONE read-only call. Account-wide on purpose: a health
+   * check that answered per identity would say "ok" to a member whose own mailbox is fine while
+   * another one silently fails, and the thing being monitored is the install, not the reader.
+   *
+   * Read-only, and cheap: nine aggregates over indexed columns. It is a route anything may poll.
+   */
+  health() {
+    const at = now();
+    const since = at - HEALTH_WINDOW_MS;
+    const count = (sql, ...args) => Number(this.sql.exec(sql, ...args).one().n) || 0;
+    return {
+      checked_at: at,
+      // CONFIGURED mailboxes. The list route unions in addresses that have only received or only
+      // been ruled on, because the operator needs to see those; a health number is a different
+      // question — how many mailboxes were set up — and `unconfigured_messages` is where mail to
+      // an unclaimed address is counted.
+      mailboxes: count("SELECT COUNT(*) AS n FROM mailboxes"),
+      // All time, like every field here without a window in its name. An unconfigured message is
+      // a standing to-do rather than an event: it does not stop being one after a day.
+      unconfigured_messages: count("SELECT COUNT(*) AS n FROM messages WHERE unconfigured = 1"),
+      inbound_24h: count("SELECT COUNT(*) AS n FROM messages WHERE direction='in' AND received_at >= ?", since),
+      outbound_24h: count("SELECT COUNT(*) AS n FROM messages WHERE direction='out' AND received_at >= ?", since),
+      last_inbound_at: this.sql.exec("SELECT MAX(received_at) AS at FROM messages WHERE direction='in'").one().at ?? null,
+      // Skips and mutes are recorded in fanout_log with ok=1, so excluding them by mode changes
+      // nothing today — it is here so that a future row written with ok=0 for "deliberately not
+      // sent" cannot turn a decision into a failure. A NULL mode still counts: a failure with no
+      // mode is a failure.
+      fanout_failures_24h: count(
+        `SELECT COUNT(*) AS n FROM fanout_log
+         WHERE ok = 0 AND (mode IS NULL OR mode NOT IN ('skip','rule')) AND at >= ?`, since),
+      // A stored message with no r2_key is one the bucket refused. It is not lost — the row, the
+      // body and the headers are all here — but the original is gone, which is the one thing this
+      // worker promises to keep.
+      archive_failures_24h: count(
+        "SELECT COUNT(*) AS n FROM messages WHERE direction='in' AND received_at >= ? AND r2_key IS NULL", since),
+      // Hidden by a rule or hidden by hand: both mean nothing was forwarded, which is what the
+      // number is for. The UI calls both "muted" too.
+      muted_24h: count(
+        "SELECT COUNT(*) AS n FROM messages WHERE direction='in' AND received_at >= ? AND hidden = 1", since),
+      // Who failed, latest attempt each, so the degraded line can say "1 member: unverified
+      // destination" instead of a bare count. Ordered by address so two runs read the same.
+      fanout_failure_members: this.#rows(
+        `SELECT member, mode, error FROM fanout_log
+         WHERE id IN (SELECT MAX(id) FROM fanout_log
+                      WHERE ok = 0 AND (mode IS NULL OR mode NOT IN ('skip','rule')) AND at >= ?
+                      GROUP BY member)
+         ORDER BY member`, since),
+    };
+  }
+
+  /**
+   * The whole configuration and NO MESSAGES — what GET /api/export returns and what the daily
+   * snapshot writes to R2. One method for both, so the file in the bucket and the file behind the
+   * route cannot drift.
+   *
+   * Addresses that only ever RECEIVED mail are left out: there is nothing configured about them
+   * to restore. Addresses that have only rules are kept, with a null display name — a rule is
+   * configuration, and an export that quietly dropped some would be a backup with a hole in it.
+   */
+  exportConfig() {
+    const boxes = this.#rows(`
+      SELECT a.address AS address, m.display_name AS display_name, m.created_at AS created_at
+      FROM (SELECT address FROM mailboxes UNION SELECT mailbox AS address FROM rules) a
+      LEFT JOIN mailboxes m ON m.address = a.address
+      ORDER BY a.address`);
+    return {
+      exported_at: now(),
+      mailboxes: boxes.map((b) => ({
+        address: b.address,
+        display_name: b.display_name ?? null,
+        created_at: b.created_at ?? null,
+        members: this.#rows("SELECT email, mode, added_at FROM members WHERE mailbox=? ORDER BY email", b.address),
+        rules: this.#rows(
+          "SELECT field, pattern, action, hits, created_at, created_by FROM rules WHERE mailbox=? ORDER BY id",
+          b.address),
+      })),
+    };
+  }
+
+  // ---------- retention ----------
+  //
+  // The only rows in SubEtha that are ever deleted, and the object does not decide which: the
+  // cutoff arrives from retention.js, the same fragment for the owner's button and for the daily
+  // sweep. The object also does not touch R2 — the worker deletes the archived copy FIRST and
+  // only then hands back the ids it is safe to forget. See purge.js for why that order.
+
+  /** What a purge WOULD take, whole and exact: the dry run a confirm step is written from. */
+  purgePreview(address, cutoff) {
+    const r = this.sql.exec(
+      `SELECT COUNT(*) AS messages, COALESCE(SUM(size), 0) AS bytes FROM messages WHERE ${PURGE_WHERE}`,
+      address, Number(cutoff) || 0).one();
+    return { messages: Number(r.messages) || 0, bytes: Number(r.bytes) || 0 };
+  }
+
+  /** The oldest `limit` of them, with what the worker needs to delete each one's archived copy. */
+  purgeCandidates(address, cutoff, limit) {
+    const n = Math.min(Math.max(Number(limit) || 100, 1), 1000);
+    return this.#rows(
+      `SELECT id, r2_key, size FROM messages WHERE ${PURGE_WHERE} ORDER BY id LIMIT ?`,
+      address, Number(cutoff) || 0, n);
+  }
+
+  /**
+   * Forget these rows. Scoped by mailbox as well as by id — the ids come from the query above and
+   * could not name another mailbox's mail, which is exactly why the guard costs nothing to keep.
+   *
+   * The fan-out rows go FIRST: a fanout_log row whose message is gone is an orphan nothing can
+   * explain, and it would never be found again to clean up.
+   *
+   * The placeholder list is built from the CHUNK'S LENGTH and every value is bound — the only
+   * thing the code chooses is how many question marks to write. Chunked because SQLite has a
+   * limit on bound variables per statement and a purge can be hundreds of rows.
+   */
+  purgeRows(address, ids) {
+    const all = (ids || []).map((v) => Number(v) || 0).filter(Boolean);
+    let removed = 0;
+    for (let i = 0; i < all.length; i += 100) {
+      const chunk = all.slice(i, i + 100);
+      const marks = chunk.map(() => "?").join(",");
+      this.sql.exec(`DELETE FROM fanout_log WHERE message_row IN (${marks})`, ...chunk);
+      removed += this.sql.exec(`DELETE FROM messages WHERE mailbox = ? AND id IN (${marks})`, address, ...chunk).rowsWritten;
+    }
+    return { removed };
+  }
+
+  /** The mailboxes that asked for a standing retention. A null is "keep forever" and is the default. */
+  retentionMailboxes() {
+    return this.#rows("SELECT address, retention_days FROM mailboxes WHERE retention_days IS NOT NULL ORDER BY address");
   }
 
   // ---------- inbound: ONE hop ----------

@@ -11,8 +11,14 @@ in one sentence, and every control below exists because of it.
 | threat | control |
 |---|---|
 | Inbound mail reaching the send-to-anyone code path | The import-graph wall: `compose.js` is not reachable from `inbound.js`. Asserted by `test/structure.test.mjs`. |
+| A cron trigger reaching it instead | The same wall: `scheduled.js` imports neither `compose.js` nor `send.js`, directly or transitively. A trigger fires with nobody behind it and nothing having checked a JWT. Asserted. |
 | A second place learning to send | `env.SEND` is touched in exactly one module, `send.js`. Asserted. |
-| Unauthenticated access to any route | Auth gate runs before any routing decision; no exception, not even a health check. Asserted. |
+| Unauthenticated access to any route | Auth gate runs before any routing decision; no exception, `GET /api/health` included. Asserted. |
+| A health check being made the one open route | `/api/health` is matched **below** the gate like everything else and answers on one line with no permission branch. Asserted. It carries counts only — no address, no subject, no sender. |
+| Every mailbox address and member harvested in one request | `GET /api/export` is owner-only; a member gets 403. Asserted. |
+| A member destroying a mailbox's history | `POST …/purge` is owner-only, the period must be one of five, and `DELETE FROM messages` has exactly one call site. All asserted. |
+| A retention setting quietly deleting more than the owner meant | The period is validated against the same fixed set on the way in **and** on the way out of the database, by the sweep that acts on it with nobody watching. A value that is not one of the five is ignored and logged, never rounded. |
+| A migration starting a deletion on deploy | `retention_days` is nullable with **no default**; null means keep forever, which is what every mailbox did before the column existed. Asserted. |
 | A forgotten `ADMIN_SECRET` matching `Bearer undefined` | The bearer check returns false on `!env.ADMIN_SECRET` before comparing. Asserted. |
 | A valid Access JWT for a *different* app on the same team | `aud` is pinned to `ACCESS_AUD`, which is **required** — no unset escape hatch. |
 | The window between deploy and the Access app existing | The shipped `ACCESS_AUD` placeholder matches no JWT, so the worker is closed until an operator pastes the real one in. Fails closed toward "costs you a login". |
@@ -30,7 +36,9 @@ in one sentence, and every control below exists because of it.
 | SQL injection through a rule pattern | The pattern is **bound**, never interpolated; only the column-and-operator fragment is chosen by the code, from a fixed set of four. `%` and `_` are escaped with a declared `ESCAPE` so a wildcard in a pattern matches itself. |
 | A rule pattern chewing the DO's single thread | **No regular expressions anywhere in a rule.** Two comparisons only — equals and contains — so there is no backtracking to trigger, on a path that runs inside the object while mail arrives. |
 | A rule quietly muting everything | An empty pattern matches nothing rather than everything; an address or domain that could never match is refused at creation; `from_domain` is an exact match, so it cannot widen to a parent domain. Tested. |
-| A rule used as a way to destroy mail | Rules **mute** and nothing else: the raw message is still archived to R2, the row is still stored, and both are still readable. There is no delete in the product and no rule action that approximates one. |
+| A rule used as a way to destroy mail | Rules **mute** and nothing else: the raw message is still archived to R2, the row is still stored, and both are still readable. No rule action approximates a delete, and the one route that deletes takes a period and a mailbox, never a pattern. |
+| An orphaned R2 object nobody can find, name or bill | A purge deletes the archived copy **first** and only then the row that names it. A failed R2 delete skips its row entirely and is counted in `r2_failed`. |
+| A mail loop through an autoresponder that marks itself the old way | The loop guard reads `X-Autoreply` and `X-Autorespond` on presence alone, beside `Auto-Submitted` and `Precedence`. Send-mode copies carry `Auto-Submitted: auto-replied`, so one coming back is stopped even where an intermediary dropped the `X-` header. **Deliberately not guards**: `X-Auto-Response-Suppress` and a machine-looking `From` local part say "do not auto-reply to me", which is not "do not forward me" — suppressing on either silently swallows the no-reply registration and notification mail a shared address exists to receive. |
 | A third-party script or font on the admin page | The UI loads **no external resource of any kind**. Everything is inline. |
 | Memory exhaustion from a huge message | Over 20 MB the raw message is streamed straight to R2 and never held in the isolate; the body is not parsed. |
 
@@ -45,7 +53,9 @@ Because the binding cannot be constrained, the constraint is structural:
 1. `compose.js` — the only module that sends to a **caller-chosen** address — is reachable from
    exactly two routes, both behind the auth gate.
 2. `inbound.js`, the whole `email()` path, does not import `compose.js` directly or
-   transitively, so the capability is not reachable from mail that arrives.
+   transitively, so the capability is not reachable from mail that arrives. Neither does
+   `scheduled.js`, the whole cron path: a trigger is an unauthenticated caller in every sense that
+   matters, and the daily run reads the Durable Object and writes R2 and nothing else.
 3. The fan-out in `inbound.js` does send, but only to an address the **owner** put on the
    member list, never to one that arrived in the message.
 4. All of that is asserted by `test/structure.test.mjs` on every run, so the day someone adds a
@@ -87,6 +97,34 @@ an owner-only field. **Adding a member is granting the right to send as that add
 
 `OWNERS` unset or left at the shipped `owner@example.com` placeholder means nobody is an owner
 and nothing can be configured — closed in the direction that costs an edit to `wrangler.jsonc`.
+
+### Deleting mail is the owner's act, and it is a real delete
+
+SubEtha's "no message deletion" rule was always a statement about what the worker does **on its
+own**: nothing it decides — a mute, a loop-guard skip, removing a mailbox's configuration — ever
+destroys mail. Retention is the deliberate exception, and it is written as one.
+
+* **Two routes, both owner-only**: `POST /api/mailboxes/:address/purge`, and the standing
+  `mailboxes.retention_days` that the daily run applies through the same code. A member gets 403
+  from both, and the structural tests assert it.
+* **It is a HARD DELETE.** The message rows go, their `fanout_log` rows go, and the archived `.eml`
+  in R2 goes. There is no trash, no tombstone and no undo. That is the point: an owner asking to
+  reclaim space, or to stop holding five-year-old mail from strangers, is asking for the bytes to
+  be gone, and a delete that left the copy in R2 would be a lie told to somebody who may be
+  deleting for a legal reason.
+* **It is never silent.** The owner picks one of five periods, the UI asks the server how much
+  would go, and the confirm states that number before anything is touched. The daily sweep logs
+  what it removed, per mailbox, as counts. Nothing deletes on a default: `retention_days` is null —
+  keep forever — unless somebody set it, including through a migration.
+* **The period cannot be a free number.** `older_than_days: 1` is a plausible slip for `365`, so
+  the route takes one of `30, 60, 90, 180, 365` and refuses anything else rather than rounding it.
+  The stored value is validated **again** by the sweep, because that one runs with nobody watching.
+* **The archived copy goes first.** A row whose object is gone still says so; an object whose row is
+  gone is unreachable, unattributable and still billed. A failed R2 delete therefore skips its row
+  and is reported.
+* **A rule still cannot delete.** The purge takes a mailbox and an age. It does not take a sender, a
+  domain, a subject or a pattern — there is no way to express "delete mail from this person", which
+  is the shape a mute rule would have had to grow into to become a delete.
 
 ### Mute rules are administration
 
@@ -156,6 +194,12 @@ The worker logs in JSON to `console`, which means Workers Logs / tail. What it l
 * **Failures**: the stage (`read`, `decode`, `parse`, `fanout_log`, `archive_failed`), the
   mailbox, the R2 key, and a truncated error string.
 * **Fetch errors**: the pathname and a truncated error string.
+* **The daily run**: the snapshot's key, whether `latest.json` was written, and the number of
+  mailboxes in it; then, per mailbox with retention, the address, the period, and the counts a
+  purge returned (`deleted`, `bytes`, `r2_failed`). A purge that removed nothing logs nothing.
+* **Purge failures**: the stage (`r2_delete`), the mailbox, the message row id, and a truncated
+  error string. Never the R2 key — a key contains a Message-ID, which is a string a stranger
+  chose.
 * **Render failures**: the message row id and a truncated error string — never any of the HTML.
 * **Envelope addresses** on an inbound failure (`to`, `from`), truncated to 200 characters.
 
@@ -174,6 +218,19 @@ debugging — the archived `.eml` in R2 is the debugging copy, and it is behind 
 Note that R2 custom metadata on each archived object carries the mailbox, the sender address
 and a timestamp. Bucket access is therefore equivalent to mailbox access; do not make the
 bucket public.
+
+The same bucket also holds `_config/YYYY-MM-DD.json` and `_config/latest.json` — the daily
+configuration snapshot, which lists **every mailbox address, every member address and every mute
+rule**. That is the same information `GET /api/export` returns to an owner, in a file that is only
+as private as the bucket. Read-only access to the bucket is therefore also a full map of who is on
+what; treat it accordingly, and if you copy the bucket somewhere for backup, copy it somewhere with
+the same access rules.
+
+`GET /api/health` is the one route that answers every authenticated identity with account-wide
+numbers. What it can tell a member they did not already know is how many mailboxes exist, how much
+mail moved, and what failed — counts, and no addresses, subjects or senders. That is a deliberate
+trade against the alternative: a health check that is owner-only cannot tell a member whether the
+quiet mailbox they are watching is quiet or broken.
 
 ## Reporting a vulnerability
 

@@ -2,7 +2,8 @@
 // everybody listening). An Email Routing rule per mailbox points at this worker; email()
 // archives the raw message to R2, stores it in the MailboxDO, and fans a copy out to that
 // mailbox's members. The UI behind Access manages mailboxes/members, reads the stored mail,
-// replies AS the mailbox and composes new mail from it.
+// replies AS the mailbox and composes new mail from it. Once a day a cron writes the
+// configuration to the bucket and applies each mailbox's retention.
 //
 // Operator steps, IN THIS ORDER — see README.md. Routing before deploy bounces mail.
 //   1. create the R2 bucket `subetha-mail`
@@ -17,10 +18,18 @@
   "compatibility_date": "2026-07-01",
   "preview_urls": false,
   // workers_dev is left at the default: this worker has a UI and the Access app needs a
-  // hostname to sit over. The worker verifies the Access JWT itself and every route — with
-  // no exception, not even a health check — returns 401 without one, so the workers.dev
-  // name being resolvable is not an open door.
+  // hostname to sit over. The worker verifies the Access JWT itself and every route — with no
+  // exception, GET /api/health included — returns 401 without one, so the workers.dev name
+  // being resolvable is not an open door. Point a monitor at /api/health with the ADMIN_SECRET
+  // bearer rather than opening a route up.
   "observability": { "enabled": true },
+
+  // Once a day: write the configuration — mailboxes, members, rules — to the MAIL bucket under
+  // _config/, and apply whatever standing retention each mailbox asked for. 03:17 UTC rather
+  // than 03:00: every cron on the platform fires on the hour, and this one has no reason to
+  // queue behind them. scheduled() never throws, so a failed run costs a day's snapshot and
+  // nothing else — see scheduled.js.
+  "triggers": { "crons": ["17 3 * * *"] },
 
   "durable_objects": {
     "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
@@ -29,6 +38,8 @@
 
   // The raw .eml of every message, in and out: <mailbox>/<YYYY>/<MM>/<message-id>.eml.
   // Written BEFORE anything is parsed, so a parser bug costs a body and never the original.
+  // The daily configuration snapshot shares the bucket under _config/ — one thing to back up,
+  // and a prefix no mailbox key can reach (a mailbox segment is an address and carries an @).
   "r2_buckets": [{ "binding": "MAIL", "bucket_name": "subetha-mail" }],
 
   // DELIBERATELY UNRESTRICTED — no allowed_destination_addresses.
@@ -42,14 +53,15 @@
   //     reachable ONLY from POST /api/messages/:id/reply and POST /api/mailboxes/:a/send,
   //     both behind the auth check that runs before any routing decision in index.js.
   //   * inbound.js — the whole email() path — does NOT import compose.js, and therefore
-  //     cannot reach it. test/structure.test.mjs asserts that on every run.
+  //     cannot reach it. Neither does scheduled.js, the whole cron path: a trigger fires with
+  //     nobody behind it. test/structure.test.mjs asserts both on every run.
   //   * the fan-out in inbound.js does send, but only to an address the OWNER put on the
   //     member list, never to one that arrived in the message.
   //
   // If that wall is ever breached, this binding turns a spam run into a spam run FROM your
   // own domain — the same domain and the same account-wide sending quota everything else
-  // you send rides on. Any change to inbound.js's imports is a change to this binding's
-  // blast radius.
+  // you send rides on. Any change to inbound.js's or scheduled.js's imports is a change to
+  // this binding's blast radius.
   "send_email": [{ "name": "SEND" }],
 
   "vars": {

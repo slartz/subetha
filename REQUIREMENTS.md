@@ -46,8 +46,19 @@ one program.
     still looks like what they sent.
 11. **Guard against mail loops** at both the message level and the member level.
 12. **Authenticate every request** — browser and automation alike — before any routing
-    decision.
-13. **Run with no build step and no dependencies**, so the source that is read is the source
+    decision. `GET /api/health` is no exception.
+13. **Answer "is this install working" in one authenticated request**, with counts an operator can
+    poll: mailboxes, mail in and out over 24 hours, the last arrival, and the two things that are
+    actually failures — a fan-out attempt that failed and a message stored without its archived
+    copy. **A quiet mailbox is not a failure**; most shared addresses are quiet most days.
+14. **Let the configuration be backed up and let it back itself up.** Mailboxes, members and mute
+    rules as one document on demand, and the same document written to the archive bucket once a
+    day. No messages in it: the mail is already in the bucket, and the configuration is the part
+    that is annoying to rebuild by hand.
+15. **Say what each mailbox is holding**, and let an owner limit it: a stored-message count, the
+    bytes, the age of the oldest message; a standing retention period per mailbox; and a deliberate
+    on-demand delete of mail older than a chosen period, which states the count before it runs.
+16. **Run with no build step and no dependencies**, so the source that is read is the source
     that runs.
 
 ## Fan-out semantics
@@ -70,9 +81,19 @@ Rules that hold in both modes:
 * One member's failure never stops the others.
 * A member is skipped, with a recorded reason, when the member address is the mailbox itself
   or when its domain is one this worker routes.
-* The whole fan-out is suppressed, with a recorded reason, when the message is
-  machine-generated (`Auto-Submitted` ≠ `no`, `Precedence: bulk|junk|list`) or already carries
-  this worker's own hop marker.
+* The whole fan-out is suppressed, with a recorded reason, when the message **has already been
+  auto-replied** or carries this worker's own hop marker: `Auto-Submitted` ≠ `no`; `X-Autoreply` or
+  `X-Autorespond` present with any value; `Precedence: bulk|junk|list`; `X-Subetha-Hop` present.
+* **"Do not auto-reply to me" is not "do not forward me", and must not be treated as it.** A shared
+  address exists precisely to receive no-reply registration mail, notifications and receipts, and
+  forwarding one of those to a human member cannot loop. So `X-Auto-Response-Suppress` is **not** a
+  suppression reason, and neither is a machine-looking `From` local part (`mailer-daemon`,
+  `postmaster`, `no-reply`, `bounces`, …). Both were implemented and removed; the tests assert that
+  neither suppresses. The accepted cost is that an autoresponder marking itself with neither
+  `Auto-Submitted` nor `X-Autoreply` is forwarded.
+* A `send`-mode copy carries `Auto-Submitted: auto-replied` as well as `X-Subetha-Hop`, because it
+  is machine-generated and because it must be stopped if it ever comes back. A reply or a compose
+  written by a person in the UI carries neither.
 * `List-Id` is **not** a suppression reason: a shared mailbox may legitimately subscribe to a
   mailing list. It is, however, stored on the row and **mutable by rule**, which is the
   difference between "this worker decided" and "an owner decided".
@@ -101,9 +122,14 @@ These are decisions, not missing features. A PR that adds one of them is out of 
   governs the lot. Owners and members scope *visibility*, not storage: this is one operator's
   install with some colleagues on it, not a service with tenants. There are two roles and there
   will not be a third, no per-mailbox admin delegation, and no groups.
-* **No message deletion.** Removing a mailbox removes its configuration only; the stored rows
-  and the R2 archive are untouched. Muting hides a row and stops its fan-out — it is not a
-  delete wearing a different word, and no rule action may become one.
+* **No message deletion that SubEtha decides on its own.** Removing a mailbox removes its
+  configuration only; the stored rows and the R2 archive are untouched. Muting hides a row and
+  stops its fan-out — it is not a delete wearing a different word, and no rule action may become
+  one. **Retention is the one exception and it is the owner's act, not the product's**: an
+  owner-only route that takes a mailbox and one of five periods, states the count before it runs,
+  and deletes the rows, their fan-out log and the archived `.eml` together. It takes no sender, no
+  domain and no pattern — there is no way to express "delete mail from this person", which is the
+  shape a rule would have had to grow into to become a delete.
 * **No dependencies, no build step, no framework** — including in the UI.
 * **No external resource loaded by the UI** — no font CDN, no script tag, no icon sprite. The
   Access login is the only thing between this page and every mailbox in the zone. The reader's

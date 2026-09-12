@@ -40,6 +40,59 @@ test("loopReason reads a plain object as happily as a Headers", () => {
   assert.equal(loopReason({}), null);
 });
 
+test("X-Autoreply and X-Autorespond suppress on their presence alone", () => {
+  // These two are on an autoresponder's OWN OUTPUT, which is what makes them guards: the
+  // message is already an automatic reply, and a fan-out replies to it five more times.
+  // Neither has a value meaning "a person wrote this", the way Auto-Submitted's "no" does.
+  assert.equal(loopReason(H({ "x-autoreply": "yes" })), "x-autoreply");
+  assert.equal(loopReason(H({ "x-autoreply": "anything at all" })), "x-autoreply");
+  assert.equal(loopReason(H({ "x-autorespond": "auto" })), "x-autorespond");
+  assert.equal(loopReason({ "x-autorespond": "1" }), "x-autorespond", "a plain object reads the same");
+  // An EMPTY value reads as absent, exactly as X-Subetha-Hop does: nothing sends one, and
+  // treating a blank as a mark would make an accident of formatting into a suppressed fan-out.
+  assert.equal(loopReason(H({ "x-autoreply": "" })), null);
+  assert.equal(loopReason(H({ "x-subetha-hop": "" })), null, "the same rule the hop header has always had");
+});
+
+test("Auto-Submitted is named before the pre-RFC spellings, and the hop before both", () => {
+  assert.equal(loopReason(H({ "auto-submitted": "auto-replied", "x-autoreply": "yes" })),
+    "auto-submitted:auto-replied");
+  assert.equal(loopReason(H({ "x-subetha-hop": "1", "x-autoreply": "yes" })), "x-subetha-hop");
+});
+
+test('"do not auto-reply to me" is NOT "do not forward me"', () => {
+  // The question this predicate answers is whether forwarding would go round again, not whether
+  // a machine sent it. A shared address exists to receive no-reply registration mail,
+  // notifications and receipts, and forwarding one of those to a human member cannot loop — a
+  // person is not an autoresponder. Both of these were tried as guards and removed; they are
+  // asserted here so the omissions read as decisions rather than as gaps.
+  //
+  // X-Auto-Response-Suppress is Exchange's, and Exchange puts it on ordinary notification mail.
+  assert.equal(loopReason(H({ "x-auto-response-suppress": "All" })), null);
+  assert.equal(loopReason(H({ "x-auto-response-suppress": "OOF, AutoReply" })), null);
+  // A machine-looking sender is a machine that will not answer back. Forward it.
+  for (const local of ["mailer-daemon", "postmaster", "no-reply", "noreply",
+                       "do-not-reply", "donotreply", "bounce", "bounces"])
+    assert.equal(loopReason(H({ from: `${local}@example.com` })), null,
+      `${local}@ is exactly the mail a shared mailbox is for`);
+  assert.equal(loopReason(H({ from: "MAILER-DAEMON@mx.example.com (Mail Delivery System)" })), null);
+  assert.equal(loopReason(H({ from: '"Mail Delivery Subsystem" <MAILER-DAEMON@mx.example.com>' })), null);
+  // A bounce that DOES mark itself is still stopped, by the mark rather than by its address.
+  assert.equal(loopReason(H({ from: "mailer-daemon@mx.example.com", "auto-submitted": "auto-generated" })),
+    "auto-submitted:auto-generated");
+  assert.equal(loopReason(H({ from: "no-reply@example.com", precedence: "bulk" })), "precedence:bulk");
+});
+
+test("a send-mode fan-out copy cannot be fanned out again", () => {
+  // The headers inbound.js puts on a send-mode copy. Either one alone stops it, which is the
+  // point of carrying both: X-Subetha-Hop is ours and an intermediary may drop it,
+  // Auto-Submitted is the standard one and a mail system may add to it.
+  const copy = { "auto-submitted": "auto-replied", "x-subetha-hop": "1" };
+  assert.equal(loopReason(H(copy)), "x-subetha-hop");
+  assert.equal(loopReason(H({ "auto-submitted": copy["auto-submitted"] })), "auto-submitted:auto-replied");
+  assert.equal(loopReason(H({ "x-subetha-hop": copy["x-subetha-hop"] })), "x-subetha-hop");
+});
+
 test("a List-Id is deliberately NOT a guard", () => {
   // A shared mailbox that subscribes to a mailing list is a normal thing to want, and
   // suppressing on List-Id would silently break it. Recorded here so the omission reads as

@@ -141,6 +141,16 @@ export async function handleInbound(message, env, ctx) {
             text: `${viaBody}\n\n${row.text || ""}`,
             html: row.html ? viaHtml(viaOpts) + row.html : null,
             headers: {
+              // RFC 3834's mark, and it belongs on this copy: a fan-out is a machine
+              // re-sending somebody else's message, so a vacation autoresponder on the far
+              // side must not answer it. It also closes the loop from the other end — if this
+              // copy ever comes back through Email Routing, loopReason() stops it on the
+              // Auto-Submitted alone, even where an intermediary dropped the X- header.
+              //
+              // A reply or a compose from the UI carries NEITHER of these: a person wrote
+              // those, and marking them auto-replied would tell the recipient's mail system
+              // to ignore a human answer.
+              "Auto-Submitted": "auto-replied",
               "X-Subetha-Hop": "1",
               "X-Subetha-Original-From": fromHdr,
             },

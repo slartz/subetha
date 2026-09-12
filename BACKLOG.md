@@ -4,6 +4,8 @@
 - [x] Bucket, secret, deploy, Access application, AUD set, redeploy. Both hostnames verified: **401** before the Access app, **302 to the team login** after.
 - [x] First mailbox configured, routing repointed, real mail stored + forwarded, reply from the UI delivered; three members (two forward, one send) all `ok`.
 - [x] HTML by default; inline `cid:` images; HTML quotes in replies; owners/members; per-member delivery status; send-mode sender attribution; Rules v1 (mute). 128 tests. First schema migration verified on live data.
+- [ ] In progress (2026-09-13): `GET /api/health` for external monitoring; loop-guard superset + `Auto-Submitted` stamp on send copies; `GET /api/export` + daily config snapshot to R2; per-mailbox storage counter, one-shot "delete older than N days", standing `retention_days` applied by the daily cron.
+- [ ] Queued behind it (same files): a design pass — "pleasing, comfortable, fine", not a redesign — and an inline-SVG favicon (envelope with a forward arrow, legible at 16px).
 - [ ] Publish decision: flip the GitHub repo public once the README reads right; keep Issues/PRs enabled.
 - [ ] Operators embedding this in a private infrastructure repo: keep your real `wrangler` config **outside** the copy/subtree so upstream merges never conflict on vars.
 
@@ -13,7 +15,7 @@ _(none known)_
 ## Next
 - [ ] Rules: `from_domain` matching subdomains as an option; a "Hide this message" button (API already takes `{hidden:1}`); per-member "hide for me" if a member ever asks.
 - [ ] Rules: retroactive subject match is ASCII-case-insensitive only (SQLite `lower()`); decide whether to fold in JS for non-ASCII mailboxes.
-- [ ] Loop guards — adopt `mailflare`'s superset: `X-Auto-Response-Suppress`, `X-Autoreply`, and skip senders whose local part is `mailer-daemon` / `postmaster` / `no-reply`; stamp send-mode fan-out with `Auto-Submitted: auto-replied` so other systems recognise it (UI replies stay unmarked — they are human).
+- [x] Loop guards: `X-Autoreply`/`X-Autorespond` added; send-mode copies stamped `Auto-Submitted: auto-replied`. **Deliberately not adopted** from `mailflare`: `X-Auto-Response-Suppress` and the `no-reply@`/`postmaster@` sender list — those mean "don't auto-reply to me", not "don't forward me", and a shared address exists to receive exactly that mail. Asserted as omissions in tests.
 - [x] Forward errors classified (unverified destination / quota / rejected / transient) with a hint on the member row. [ ] A retry affordance for transient ones.
 - [ ] Runtime smoke test of the inbound path under `wrangler dev` (structural tests only, today).
 - [ ] **Attachments on reply/compose**: `multipart/mixed` with base64 parts in `build-mime.js`, a file input on the reply and compose forms, size cap per Email Sending's message limit (check the docs before setting it). No schema or binding change — outbound is archived raw already. Interim: reply from the forwarded copy in a normal client.

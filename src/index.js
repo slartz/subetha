@@ -24,6 +24,10 @@ import { validAddr } from "./build-mime.js";
 import { canAdmin, canView, parseOwners, visibleMailboxes } from "./perm.js";
 import { normaliseRule, ruleError } from "./rules.js";
 import { inlineParts, renderHtml } from "./html-render.js";
+import { shapeHealth } from "./health.js";
+import { purgeDays, retentionValue, RETENTION_DAYS } from "./retention.js";
+import { purgeOlderThan } from "./purge.js";
+import { runScheduled } from "./scheduled.js";
 import { renderUi } from "./ui.js";
 export { MailboxDO } from "./mailbox-do.js";
 
@@ -75,6 +79,27 @@ export default {
       return json({ error: msg }, 500);
     }
   },
+
+  // The daily run: a snapshot of the configuration to R2, and the standing retention each
+  // mailbox asked for. Wrapped like email() is, and for a related reason — there is nobody on
+  // the other end of a cron to tell, so a throw here is a failure that only a dashboard would
+  // ever show. runScheduled() wraps each half again so one cannot cost the other.
+  //
+  // It reaches the DO and R2 and NOTHING ELSE. scheduled.js does not import compose.js or
+  // send.js: a cron is an unauthenticated caller in every sense that matters, and the send path
+  // stays on the far side of the same wall email() sits behind. Asserted.
+  async scheduled(event, env, ctx) {
+    try {
+      const stub = env.MAILBOX.get(env.MAILBOX.idFromName("subetha"));
+      await runScheduled(env, stub, event?.scheduledTime || Date.now());
+    } catch (e) {
+      console.error(JSON.stringify({
+        evt: "subetha.scheduled_failed",
+        cron: String(event?.cron || "").slice(0, 40),
+        error: String(e?.message || e).slice(0, 400),
+      }));
+    }
+  },
 };
 
 export async function route(request, env, ctx) {
@@ -83,8 +108,10 @@ export async function route(request, env, ctx) {
 
   // AUTH FIRST, on every path, before any routing decision. Access will 302 a browser once
   // the Access app exists; until then — and for anything that reaches the worker around
-  // Access — this is the wall. There is no unauthenticated route, not even a health check:
-  // a worker that can send mail as any mailbox in the zone has nothing safe to say.
+  // Access — this is the wall. There is no unauthenticated route: /api/health included, and
+  // that is the whole reason it is named here — a health endpoint is the one route a person
+  // reaches for an exception for, and a worker that can send mail as any mailbox in the zone
+  // has nothing safe to say to an anonymous caller, not even how busy it has been.
   let identity = null;
   if (path.startsWith("/api/") && await bearerOk(request, env)) identity = "bearer";
   else if (await accessOk(request, env)) identity = accessEmail(request) || "access";
@@ -106,17 +133,44 @@ export async function route(request, env, ctx) {
   // whether to honour what the editor posts; this is only what the page is told.
   if (path === "/api/me" && request.method === "GET") return json({ identity, is_owner: admin });
 
+  // Health. ANY authenticated identity may read it and the numbers are account-wide — there is
+  // no per-identity view of "is this install working", and the counts leak nothing an owner
+  // would mind a member seeing: how many mailboxes exist, how much arrived, what failed. Not
+  // an address, not a subject, not who wrote. It is deliberately NOT owner-only, so a member
+  // watching a mailbox that has gone quiet can tell "nothing arrived" from "nothing works".
+  if (path === "/api/health" && request.method === "GET") return json(shapeHealth(await stub.health()));
+
+  // The configuration, whole, as a file to keep. OWNER-ONLY: it is every mailbox, every member
+  // address and every rule in one response, which is the member list's kind of question rather
+  // than the reader's — and a member is on one mailbox, not on this. No messages are in it.
+  if (path === "/api/export" && request.method === "GET") {
+    if (!canAdmin(identity, owners)) return forbidden();
+    return json(await stub.exportConfig());
+  }
+
   // /api/mailboxes …
   if (seg[0] === "api" && seg[1] === "mailboxes") {
     if (seg.length === 2 && request.method === "GET")
       return json(visibleMailboxes(await stub.mailboxes(), identity, owners));
 
     const address = String(seg[2] || "").trim().toLowerCase();
+    // One mailbox, in the same shape the list gives it — members with their last delivery, the
+    // counts, and what it is costing in storage. A view question, like every other route that
+    // names a mailbox and does not change it.
+    if (seg.length === 3 && request.method === "GET") {
+      if (!(await mayView(stub, identity, owners, address))) return forbidden();
+      const box = await stub.mailbox(address);
+      return box ? json(box) : json({ error: "not found" }, 404);
+    }
     if (seg.length === 3 && request.method === "PUT") {
       if (!canAdmin(identity, owners)) return forbidden();
       if (!validAddr(address)) return json({ error: "invalid mailbox address" }, 400);
       const body = await request.json().catch(() => ({}));
       const display_name = String(body?.display_name ?? "").slice(0, 200) || null;
+      // Null — keep forever — unless the caller names one of the offered periods. Anything else
+      // is refused rather than rounded to the nearest one: this setting deletes mail.
+      const retention = retentionValue(body?.retention_days);
+      if (retention.error) return json({ error: retention.error }, 400);
       const raw = Array.isArray(body?.members) ? body.members : [];
       if (raw.length > 200) return json({ error: "too many members" }, 400);
       const seen = new Set();
@@ -130,7 +184,7 @@ export async function route(request, env, ctx) {
         seen.add(email);
         members.push({ email, mode });
       }
-      return json(await stub.upsertMailbox(address, display_name, members));
+      return json(await stub.upsertMailbox(address, display_name, members, retention.days));
     }
     if (seg.length === 3 && request.method === "DELETE") {
       if (!canAdmin(identity, owners)) return forbidden();
@@ -171,6 +225,19 @@ export async function route(request, env, ctx) {
     if (seg.length === 5 && seg[3] === "rules" && request.method === "DELETE") {
       if (!canAdmin(identity, owners)) return forbidden();
       return json(await stub.deleteRule(address, Number(seg[4]) || 0));
+    }
+
+    // The one route that destroys mail, and the only one. OWNER-ONLY, and deliberately hard to
+    // trip: the period must be one of five, not any number of days, because "1" is a plausible
+    // slip for "365" and it would take the mailbox with it. `?dry_run=1` answers with the counts
+    // and touches nothing, which is what the confirm step in the UI is written from.
+    if (seg.length === 4 && seg[3] === "purge" && request.method === "POST") {
+      if (!canAdmin(identity, owners)) return forbidden();
+      if (!validAddr(address)) return json({ error: "invalid mailbox address" }, 400);
+      const body = await request.json().catch(() => ({}));
+      const days = purgeDays(body?.older_than_days);
+      if (!days) return json({ error: `older_than_days must be one of ${RETENTION_DAYS.join(", ")}` }, 400);
+      return json(await purgeOlderThan(env, stub, address, days, url.searchParams.get("dry_run") === "1"));
     }
   }
 

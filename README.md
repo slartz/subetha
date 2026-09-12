@@ -5,7 +5,7 @@ is **fanned out to a member list**, **kept as a stored copy** you can read in a 
 and **replied to or composed from** that same address — sending natively through Cloudflare
 Email Routing and Email Sending, with no build step, no framework and no dependencies. Named
 for the sub-etha net: one address, everybody listening. From the outside each mailbox behaves
-like an ordinary mailbox; from the inside it is ~2,800 lines of plain JavaScript and a SQLite
+like an ordinary mailbox; from the inside it is ~3,500 lines of plain JavaScript and a SQLite
 Durable Object.
 
 ## Why this exists
@@ -36,7 +36,7 @@ this is.
 
 | module | what it is |
 |---|---|
-| `index.js` | the two entry points (`email()`, `fetch()`), the auth gate, the router |
+| `index.js` | the three entry points (`email()`, `fetch()`, `scheduled()`), the auth gate, the router |
 | `inbound.js` | the whole `email()` path: archive, parse, store, fan out, record |
 | `compose.js` | reply and compose — send as the mailbox to a **caller-chosen** address |
 | `send.js` | the only module that touches `env.SEND`; a transport and nothing else |
@@ -45,6 +45,10 @@ this is.
 | `mime.js` | MIME primitives (pure): anchored header lookup, part splitting, charsets |
 | `mailbox-do.js` | `MailboxDO` — all state, SQLite, one instance, RPC only |
 | `loop-guard.js` | the two loop predicates (pure) |
+| `scheduled.js` | the daily run: the config snapshot to R2, then each mailbox's retention |
+| `purge.js` | deleting old mail: the R2 object first, then the rows that name it |
+| `retention.js` | retention (pure): the period set, the cutoff, the selection predicate |
+| `health.js` | the health document (pure): `ok`, and the `degraded` sentences |
 | `rules.js` | mute rules (pure): matching, validating, and the same rule as a SQL predicate |
 | `fanout-status.js` | delivery status (pure): classifying a fan-out error into something to act on |
 | `html-render.js` | the HTML pass (pure): `cid:` inlining, remote-image blocking, sanitising, the reply quote |
@@ -64,7 +68,9 @@ every run:
 2. **`compose.js` is unreachable from `email()`.** The `send_email` binding is deliberately
    unrestricted (see *Security notes*), so the compensating control is the module graph:
    `inbound.js` does not import `compose.js`, directly or transitively. The test walks the
-   import graph and fails the build the day someone adds a convenient import.
+   import graph and fails the build the day someone adds a convenient import. **The same is
+   asserted for `scheduled()`** — a cron is an unauthenticated caller in every sense that
+   matters, so `scheduled.js` reaches neither `compose.js` nor `send.js`.
 
 ## Who sees what
 
@@ -77,9 +83,11 @@ by every route.
 | on a mailbox's member list, in either mode | — | yes | — |
 | see it in the mailbox list | every mailbox | only its own | nothing |
 | read, download raw, reply, compose from it | any mailbox | its own | 403 |
-| see its mute rules | any mailbox | its own | 403 |
-| create, edit or delete a mailbox; edit members | yes | 403 | 403 |
+| see its mute rules, its storage, its retention | any mailbox | its own | 403 |
+| read `GET /api/health` | counts | the same counts | the same counts |
+| create, edit or delete a mailbox; edit members; set retention | yes | 403 | 403 |
 | create or delete a mute rule; hide or un-hide a message | yes | 403 | 403 |
+| export the configuration; delete old mail | yes | 403 | 403 |
 
 Identity is the Access JWT's `email` claim, lowercased; the `ADMIN_SECRET` bearer is
 owner-equivalent. Someone who is neither still gets the page at `/` — with an empty list and a
@@ -133,6 +141,7 @@ than lost.
 ```
 From:     "<sender> via <mailbox display name>" <mailbox@example.com>
 Reply-To: <the original sender>
+Auto-Submitted: auto-replied
 X-Subetha-Hop: 1
 X-Subetha-Original-From: <the original From header, verbatim>
 
@@ -146,6 +155,12 @@ name** and one line at the top of the body say who actually wrote, in the two pl
 pane will show it. (An html message keeps its own markup, with the same line in a small muted
 `<div>` above it.) Without that, every message in a send-mode mailbox looks like it came from
 the mailbox itself and the real sender survives only in headers nobody's client displays.
+
+`Auto-Submitted: auto-replied` is on the copy because it is true — a machine is re-sending
+somebody else's message, and a vacation autoresponder on the far side must not answer it — and
+because it closes the loop from the other end: if the copy ever arrives back here it is stopped on
+that header alone, even where an intermediary dropped the `X-` one. **A reply or a compose you
+write in the UI carries neither header.** You are a person.
 
 No verification of the destination is needed, so `send` reaches anyone — but it **uses the
 account's sending quota**, and it **re-originates the message**. That last point matters for
@@ -166,12 +181,28 @@ fails, the other members still get theirs, and until it is on the row nothing sa
 A shared mailbox that fans out is a loop generator if you let it, so there are two independent
 guards, both pure and both tested.
 
-**Message level** (suppresses the whole fan-out):
+**Message level** (suppresses the whole fan-out), in the order they are checked:
 
-* `Auto-Submitted` present and not `no` (RFC 3834)
-* `Precedence` in {`bulk`, `junk`, `list`}
 * `X-Subetha-Hop` present — this worker's own mark, so a message it sent that somehow arrives
   back stops dead instead of going round again
+* `Auto-Submitted` present and not `no` (RFC 3834)
+* `X-Autoreply` or `X-Autorespond` present with **any** value — the two spellings an autoresponder
+  puts on *its own output*, which predate the RFC. Neither has a value meaning "a person wrote
+  this", so there is no equivalent of `no` to honour
+* `Precedence` in {`bulk`, `junk`, `list`}
+
+**What is deliberately not a guard**, because it answers a different question:
+
+* **`X-Auto-Response-Suppress`.** It means "do not auto-reply to me", and that is not "do not
+  forward me". Exchange puts it on ordinary notification mail.
+* **The sender's address** — `mailer-daemon@`, `no-reply@`, `bounces@` and the rest. A shared
+  address exists precisely to receive no-reply registration mail, notifications and receipts, and
+  forwarding one of those to a human member cannot loop: a person is not an autoresponder. A
+  bounce that actually marks itself is still stopped, by its mark rather than by its address.
+
+Both were built, tried and removed, and the tests now assert that neither suppresses. The trade is
+that an autoresponder marking itself with neither `Auto-Submitted` nor `X-Autoreply` gets forwarded
+— the cheaper failure, against silently swallowing the mail the mailbox is for.
 
 **Member level** (skips that one member):
 
@@ -209,7 +240,9 @@ What a mute does, and what it deliberately does not:
   stored, so nothing is forwarded and nothing is sent. It is not a UI filter.
 * **Nothing is deleted.** The raw message is still archived to R2, the row is still stored, and
   the message is still readable — tick **show muted** in the message list, where it carries a
-  `muted · rule #n` badge. There is no delete in SubEtha and a rule is not a way to get one.
+  `muted · rule #n` badge. A rule is not a way to delete mail: the only thing that deletes is
+  retention, it takes a mailbox and an age rather than a pattern, and it is a separate owner-only
+  route (see *Storage and retention*).
 * **Creating a rule is retroactive**: existing stored messages that match are hidden too, and
   the UI tells you how many. **Deleting a rule is not** — messages it already muted stay muted,
   because "stop muting from now on" is what removing a rule almost always means. Un-hiding is
@@ -224,6 +257,109 @@ What a mute does, and what it deliberately does not:
 * **The loop guards run first.** A message they suppress is recorded as suppressed, not as muted.
 
 Rules live under the members editor, with each one's hit count.
+
+## Health
+
+```
+GET /api/health
+```
+
+```json
+{ "ok": true, "checked_at": 1700000000000,
+  "mailboxes": 3, "unconfigured_messages": 0,
+  "inbound_24h": 12, "outbound_24h": 1, "last_inbound_at": 1700000000000,
+  "fanout_failures_24h": 0, "archive_failures_24h": 0, "muted_24h": 0,
+  "degraded": [] }
+```
+
+`ok` is false for exactly two reasons — a fan-out attempt that failed, or a message stored without
+its archived copy — and `degraded` then carries one short sentence each:
+
+```json
+"degraded": ["2 fan-out failures in 24h (1 member: unverified destination)",
+             "1 message archived without R2 copy"]
+```
+
+* **A quiet mailbox is not degraded.** No inbound mail is the normal state of most shared
+  addresses, and an install that has never received anything is new rather than broken.
+  `last_inbound_at` is `null` in that case, never `0`.
+* **It needs authentication, like every other route.** There is no unauthenticated health check
+  here: a worker that can send mail as any address in your zone has nothing safe to say to an
+  anonymous caller, not even how busy it has been. Point your monitor at it with the
+  `ADMIN_SECRET` bearer.
+* **Any authenticated identity may read it**, and the numbers are account-wide. It carries counts
+  and no addresses, and a member watching a mailbox that has gone quiet needs to tell "nothing
+  arrived" from "nothing works".
+* **`mailboxes` counts configured mailboxes.** Mail that arrived at an address nobody has claimed
+  is counted separately, in `unconfigured_messages` — and a field without a window in its name is
+  all-time.
+
+## Backing up the configuration
+
+```
+GET /api/export                          owner or the bearer
+_config/YYYY-MM-DD.json  in R2           written daily at 03:17 UTC
+_config/latest.json      in R2           the same document, always the newest
+```
+
+The mail is already in R2 whole. What is annoying to rebuild by hand is the configuration, so that
+is what is exported: every mailbox, its display name, its members with their modes, and its mute
+rules with their hit counts. **No messages.** The route and the snapshot call the same method, so
+the file in the bucket and the file behind the route cannot drift, and the `_config/` prefix cannot
+collide with a mailbox's keys (a mailbox key's first segment is an email address).
+
+Note that `retention_days` is **not** in the export document, deliberately: its shape is a contract
+that predates the field. A mailbox restored from a snapshot keeps its mail, which is the safe
+direction.
+
+The daily run is a cron trigger (`"triggers": {"crons": ["17 3 * * *"]}` in `wrangler.jsonc`) and
+`scheduled()` never throws — a failed run costs a day's snapshot and nothing else.
+
+## Storage and retention
+
+Every mailbox carries what it is holding, in the list and in `GET /api/mailboxes/:address`:
+
+```json
+"storage": { "messages": 412, "bytes": 9184233, "oldest_at": 1690000000000 }
+```
+
+`bytes` is the sum of the stored `size` column, both directions. **R2's own usage for that mailbox
+is close to this and not identical**: a message whose archive failed has a size and no object, each
+object carries its own metadata, and an outbound row's size is the MIME this worker built rather
+than what the far end stored. It answers "is this mailbox getting large", not "what is the bill".
+
+The owner's panel shows it as a line — `412 messages · 8.8 MB · oldest 2026-01-04` — above two
+controls:
+
+**Retention** — *Keep forever* (the default) or 30 / 60 / 90 / 180 / 365 days, saved with the
+mailbox. The daily run deletes anything older, and logs what it removed.
+
+**Delete older than…** — the same five periods, on demand. It asks the server how much would go
+(`?dry_run=1`), states that number in a confirm, and only then deletes.
+
+```
+POST /api/mailboxes/:address/purge   {"older_than_days": 90}      → {deleted, bytes, r2_failed}
+POST /api/mailboxes/:address/purge?dry_run=1                      → the same, dry_run: true
+```
+
+* **This is a hard delete, and it is the only one in SubEtha.** The rows go, their fan-out log rows
+  go, and the archived `.eml` in R2 goes. "No message deletion" was always a promise about what
+  this worker does *on its own* — a mute hides, removing a mailbox keeps its mail, a rule has no
+  action that approximates a delete — and not a promise that an owner may never remove their own
+  mail. It is an owner's explicit act, with the count in front of them first.
+* **The archived copy goes FIRST, then the row.** If R2 refuses, that message is skipped whole and
+  counted in `r2_failed`; the next run tries again. A row deleted while its object survived would
+  be an orphan nobody could find.
+* **Both directions, strictly older than the cutoff.** A reply is as old as the message it
+  answered.
+* **The period is one of five, not any number of days.** `older_than_days: 1` is a plausible slip
+  for `365`, and this route deletes mail.
+* **500 messages per call.** Deleting from R2 is a subrequest and a worker has a budget of them.
+  Whatever is left goes on the next run — daily, or another press of the button, and the UI says so
+  when there is more.
+* **Retention left out of a `PUT` means keep forever.** The editor posts the whole configuration,
+  so a client that has never heard of `retention_days` turns a standing deletion off rather than
+  leaving one running it cannot see.
 
 ## Deploy
 
@@ -249,7 +385,10 @@ Rules live under the members editor, with each one's hit count.
    an owner and nothing can be configured.
 7. **Set `ROUTED_DOMAINS`** to the comma-separated list of domains whose mail this worker
    routes, and deploy.
-8. **Only now, point the Email Routing rules** for each mailbox address at the worker.
+8. **Only now, point the Email Routing rules** for each mailbox address at the worker. The cron
+   trigger in `wrangler.jsonc` is created by the same deploy; it writes the configuration snapshot
+   to `_config/` in the bucket every day at 03:17 UTC and applies any retention a mailbox has been
+   given.
 9. Open the UI, click **New mailbox…**, enter the address, set a display name and the
    members, and **Save**.
 
@@ -260,7 +399,7 @@ the reader has an "unconfigured only" filter. Nothing is rejected and nothing is
 ## API reference
 
 Every route requires authentication, checked **before any routing decision**. There is no
-unauthenticated route, not even a health check.
+unauthenticated route — `GET /api/health` included.
 
 * **Browser** — a Cloudflare Access JWT, taken from the `Cf-Access-Jwt-Assertion` header or
   the `CF_Authorization` cookie, verified against the team's signing keys and pinned to
@@ -272,8 +411,11 @@ unauthenticated route, not even a health check.
 |---|---|---|---|
 | GET | `/` | the UI | anyone authenticated |
 | GET | `/api/me` | `{identity, is_owner}` — what the UI draws itself from | anyone authenticated |
-| GET | `/api/mailboxes` | the mailboxes **this identity may see**: address, display name, members (each with `last`), counts, `rule_count`, `muted_count` | anyone authenticated |
-| PUT | `/api/mailboxes/:address` | `{display_name, members:[{email, mode}]}` — members are **replaced**, not merged; the response carries each member's `last` | owner |
+| GET | `/api/health` | counts and `{ok, degraded}` — account-wide, no addresses | anyone authenticated |
+| GET | `/api/export` | the whole configuration — mailboxes, members, rules; **no messages** | owner |
+| GET | `/api/mailboxes` | the mailboxes **this identity may see**: address, display name, members (each with `last`), counts, `rule_count`, `muted_count`, `retention_days`, `storage` | anyone authenticated |
+| GET | `/api/mailboxes/:address` | one mailbox in the same shape, or `404` | owner or member |
+| PUT | `/api/mailboxes/:address` | `{display_name, members:[{email, mode}], retention_days}` — members are **replaced**, not merged, and an absent `retention_days` is `null` (keep forever); the response carries each member's `last` | owner |
 | DELETE | `/api/mailboxes/:address` | removes the configuration; **stored messages are kept** | owner |
 | GET | `/api/mailboxes/:address/messages?before=&limit=&hidden=` | newest first, no bodies, ≤100 per page; muted messages are excluded unless `hidden=1` | owner or member |
 | POST | `/api/mailboxes/:address/send` | `{to, cc?, subject, text}` — compose from the mailbox | owner or member |
@@ -284,6 +426,7 @@ unauthenticated route, not even a health check.
 | GET | `/api/messages/:id/raw` | the archived `.eml` straight from R2 | owner or member |
 | POST | `/api/messages/:id/reply` | `{text, cc?}` — reply as the mailbox | owner or member |
 | POST | `/api/messages/:id/hidden` | `{hidden: 0\|1}` — hide or un-hide one message; un-hiding clears `muted_by` | owner |
+| POST | `/api/mailboxes/:address/purge` | `{older_than_days: 30\|60\|90\|180\|365}` → `{deleted, bytes, r2_failed}`; **deletes mail and its archived copies**. `?dry_run=1` counts and touches nothing | owner |
 
 Anything an identity may not reach is `403`, including a message whose mailbox it is not on.
 `/api/me` and `/api/mailboxes` are identity-scoped reads rather than gated ones: they answer for
@@ -314,9 +457,11 @@ on the contact page — not a mail client, and not a helpdesk.
 * **No multi-tenancy.** One Durable Object instance holds every mailbox and one `OWNERS` list
   governs the lot. Owners and members scope *visibility*, not storage; this is one operator's
   install, not a service with tenants.
-* **No delete.** Deleting a mailbox removes its configuration; its messages and its archive
-  stay. **Muting is not deleting either** — a muted message is stored, readable and
-  downloadable; what stops is the fan-out.
+* **Nothing deletes mail except the owner, by name.** Deleting a mailbox removes its
+  configuration; its messages and its archive stay. **Muting is not deleting either** — a muted
+  message is stored, readable and downloadable; what stops is the fan-out. The one exception is
+  **retention** (see *Storage and retention*): `POST …/purge` and the standing `retention_days`,
+  both owner-only, both hard deletes, and the button states the count before it runs.
 * **Rules mute and nothing else.** No move, no tag, no auto-reply, no forward-to-one-person, and
   no regular expressions.
 
@@ -334,8 +479,13 @@ advance. The compensating controls are:
   is a question about its two callers rather than a question about the whole codebase;
 * both of those are asserted by tests, not merely documented.
 
-**Authentication is on every route**, evaluated before the router looks at the path. A worker
-that can send mail as any address in your zone has nothing safe to say to an anonymous caller.
+**Authentication is on every route**, evaluated before the router looks at the path — including
+the health check. A worker that can send mail as any address in your zone has nothing safe to say
+to an anonymous caller, not even how busy it has been.
+
+**The cron cannot send mail.** `scheduled.js` imports neither `compose.js` nor `send.js`, and the
+import graph is walked by the tests: a trigger that fires with nobody behind it sits on the far
+side of the same wall `email()` does.
 
 **An unset `ADMIN_SECRET` authenticates nothing** — the bearer check bails on `!env.ADMIN_SECRET`
 before comparing, so a forgotten secret cannot be matched by the literal string
@@ -370,10 +520,10 @@ See `SECURITY.md` for the full threat model.
 node --test test/*.test.mjs
 ```
 
-No dependencies and no test runner to install — `node:test`, `node:assert` and nothing else.
-The suite covers the body parser, the MIME builder, the loop guards, the R2 key shape, and the
-structural wall around `compose.js`. See `TESTS.md` for what each file covers and what is not
-covered.
+**159 tests, no dependencies and no test runner to install** — `node:test`, `node:assert` and
+nothing else. The suite covers the body parser, the MIME builder, the loop guards, the health
+document, the retention predicate, the R2 key shape, and the structural wall around `compose.js`.
+See `TESTS.md` for what each file covers and what is not covered.
 
 ## Status
 

@@ -50,6 +50,20 @@ export function renderUi({ identity } = {}) {
   </div>
   <table class="members"><tbody id="rules"></tbody></table>
   <div class="row"><span class="note" id="rulesnote"></span></div>
+  <div class="row" id="storagerow">
+    <span class="note" id="storage"></span>
+    <span class="grow"></span>
+    <label class="lbl" for="ret">retention</label>
+    <select id="ret">
+      <option value="">Keep forever</option>
+      <option value="30">30 days</option>
+      <option value="60">60 days</option>
+      <option value="90">90 days</option>
+      <option value="180">180 days</option>
+      <option value="365">365 days</option>
+    </select>
+    <button id="purge">Delete older than…</button>
+  </div>
   <div class="err" id="cfgerr"></div>
 </div>
 
@@ -182,12 +196,73 @@ function readMembers() {
   }
   return out;
 }
+// Bytes as an owner reads them. One decimal, because "0 MB" for 400 KB of mail reads as
+// nothing stored at all and the whole point of the line is to say how much there is.
+function size(bytes) {
+  var n = Number(bytes) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+// What this mailbox holds, and how old the oldest of it is — the two numbers a retention
+// decision is made from, said in one line above the control that acts on them.
+function showStorage(b) {
+  var s = (b && b.storage) || null;
+  if (!s || !s.messages) { el("storage").textContent = "No messages stored."; return; }
+  // The stored sizes, which is what the retention decision is about. R2's own usage for the same
+  // mailbox is close to this and not identical — that caveat belongs in the README, not on a line
+  // an owner reads to decide whether to keep 90 days or 365.
+  el("storage").textContent = s.messages + (s.messages === 1 ? " message · " : " messages · ") + size(s.bytes) +
+    (s.oldest_at ? " · oldest " + new Date(s.oldest_at).toISOString().slice(0, 10) : "");
+}
 function showConfig(b) {
   el("dn").value = (b && b.display_name) || "";
+  el("ret").value = b && b.retention_days ? String(b.retention_days) : "";
+  showStorage(b);
   var tb = el("members"); tb.innerHTML = "";
   var ms = (b && b.members) || [];
   for (var i = 0; i < ms.length; i++) tb.appendChild(memberRow(ms[i].email, ms[i].mode, ms[i].last));
   if (!ms.length && isOwner) tb.appendChild(memberRow("", "forward"));
+}
+// Deleting mail is the one irreversible thing in SubEtha, so it is two steps and the second one
+// states a number the SERVER counted: the dry run asks what would go, and only what comes back
+// from it is put in front of the operator. A confirm that says "some messages" is a confirm
+// nobody reads.
+function purgeModal() {
+  if (!cur) return toast("No mailbox selected");
+  var d = document.createElement("div");
+  d.className = "modal";
+  d.innerHTML = '<div class="card"><h2>Delete old mail from ' + esc(cur) + "</h2>" +
+    '<p class="note">This deletes stored messages older than the period you pick — both received and sent — together with their archived copies in R2. It cannot be undone, and it is the only thing in SubEtha that removes mail. You will be told how much before anything goes.</p>' +
+    '<div class="row"><label class="lbl" for="pdays">older than</label><select id="pdays">' +
+    '<option value="30">30 days</option><option value="60">60 days</option>' +
+    '<option value="90">90 days</option><option value="180">180 days</option>' +
+    '<option value="365" selected>365 days</option></select>' +
+    '<button id="pok" class="primary">Check…</button><button id="pcancel">Cancel</button>' +
+    '<span class="err" id="perr"></span></div></div>';
+  document.body.appendChild(d);
+  el("pcancel").onclick = function () { d.remove(); };
+  el("pok").onclick = async function () {
+    el("pok").disabled = true; el("perr").textContent = "";
+    var days = el("pdays").value;
+    var base = "/api/mailboxes/" + encodeURIComponent(cur) + "/purge";
+    try {
+      var dry = await api(base + "?dry_run=1", { method: "POST", body: { older_than_days: Number(days) } });
+      if (!dry.deleted) { d.remove(); return toast("Nothing older than " + days + " days"); }
+      if (!confirm("Delete " + dry.deleted + " message" + (dry.deleted === 1 ? "" : "s") + " (" + size(dry.bytes) +
+                   ") older than " + days + " days from " + cur + "?\\n\\nThe archived copies go too. This cannot be undone.")) {
+        el("pok").disabled = false; return;
+      }
+      var r = await api(base, { method: "POST", body: { older_than_days: Number(days) } });
+      d.remove();
+      // A purge takes a batch at a time, so say what actually went rather than what was asked
+      // for — and say it plainly when there is more left.
+      toast("Deleted " + r.deleted + " of " + dry.deleted + " (" + size(r.bytes) + ")" +
+            (r.r2_failed ? " — " + r.r2_failed + " archived copies could not be removed and were kept" : "") +
+            (r.deleted < dry.deleted ? " — run it again for the rest" : ""));
+      await loadBoxes(cur);
+    } catch (e) { el("perr").textContent = String(e.message || e); el("pok").disabled = false; }
+  };
 }
 // ---- mute rules --------------------------------------------------------
 // A rule reads as the sentence it is, because "subject / black friday" in a table is a thing
@@ -238,7 +313,9 @@ async function removeRule(id) {
 // A member sees the configuration and cannot change it: the editor's controls are removed
 // rather than disabled, so there is nothing to click that would come back 403.
 function applyRole() {
-  var ids = ["newbox", "save", "del", "addmember"];
+  // storagerow goes whole: retention and the purge button are owner-only, and a storage line on
+  // its own, under two controls a member cannot use, is a line asking a question it cannot answer.
+  var ids = ["newbox", "save", "del", "addmember", "storagerow"];
   for (var i = 0; i < ids.length; i++) if (el(ids[i])) el(ids[i]).style.display = isOwner ? "" : "none";
   el("dn").disabled = !isOwner;
   el("who").textContent = el("who").textContent + (isOwner ? " · owner" : "");
@@ -522,6 +599,7 @@ el("showmuted").onchange = function () {
 };
 el("more").onclick = function () { loadMessages(false).catch(function (e) { toast(String(e.message || e)); }); };
 el("compose").onclick = composeModal;
+el("purge").onclick = purgeModal;
 el("newbox").onclick = function () {
   var a = prompt("Mailbox address (it must already have an Email Routing rule pointing at SubEtha):");
   if (!a) return;
@@ -533,7 +611,11 @@ el("newbox").onclick = function () {
 el("save").onclick = async function () {
   el("cfgerr").textContent = "";
   try {
-    await api("/api/mailboxes/" + encodeURIComponent(cur), { method: "PUT", body: { display_name: el("dn").value, members: readMembers() } });
+    // Retention goes with the save because it is configuration, not an action: the PUT carries
+    // the whole of it, and an empty select is null — keep forever.
+    await api("/api/mailboxes/" + encodeURIComponent(cur), { method: "PUT", body: {
+      display_name: el("dn").value, members: readMembers(),
+      retention_days: el("ret").value ? Number(el("ret").value) : null } });
     toast("Saved"); await loadBoxes(cur);
   } catch (e) { el("cfgerr").textContent = String(e.message || e); }
 };

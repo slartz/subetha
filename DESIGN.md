@@ -8,24 +8,28 @@ Read this before changing anything. Several things that look like omissions are 
 index.js ──┬─ inbound.js ──┬─ archive.js ──── R2
  (email)   │   (email path)│─ parse-mail.js ─ mime.js
  (fetch)   │               │─ build-mime.js
-           │               │─ loop-guard.js ─ build-mime.js
+ (cron)    │               │─ loop-guard.js ─ build-mime.js
            │               └─ send.js ─────── env.SEND
            │
            ├─ compose.js ──┬─ build-mime.js        ← NOT reachable from inbound.js
-           │  (fetch only) │─ html-render.js
+           │  (fetch only) │─ html-render.js         and NOT from scheduled.js
            │               │─ send.js
            │               └─ archive.js
+           ├─ scheduled.js ┬─ purge.js ─── retention.js   the daily run (cron only)
+           │  (cron only)  └─ archive.js ── R2
+           ├─ purge.js ─────── retention.js       R2 first, then the rows
+           ├─ health.js ────── fanout-status.js   the health document, ok, and degraded
            ├─ html-render.js ─ mime.js / build-mime.js
            ├─ perm.js          who may see and change which mailbox
            ├─ rules.js ─────── build-mime.js   mute matching, and the same rule as SQL
            ├─ access.js        Access JWT verification
            ├─ ui.js ────────── theme.js / html-render.js
-           └─ mailbox-do.js ── fanout-status.js / rules.js   (the MailboxDO class)
+           └─ mailbox-do.js ── fanout-status.js / rules.js / health.js / retention.js
 ```
 
 | module | pure? | responsibility |
 |---|---|---|
-| `index.js` | no | `email()` and `fetch()` entry points, the auth gate, the router |
+| `index.js` | no | `email()`, `fetch()` and `scheduled()` entry points, the auth gate, the router |
 | `inbound.js` | no | the whole `email()` path, start to finish |
 | `compose.js` | no | reply and compose: send as the mailbox to a caller-chosen address |
 | `send.js` | no | the **only** module that touches `env.SEND`; a transport, nothing else |
@@ -34,6 +38,10 @@ index.js ──┬─ inbound.js ──┬─ archive.js ──── R2
 | `build-mime.js` | yes | RFC 5322 builder, address validation, header sanitising, quoting |
 | `parse-mail.js` | yes | body parsing — the only thing read out of the raw message |
 | `mime.js` | yes | MIME primitives: anchored header lookup, part splitting, charsets |
+| `scheduled.js` | no | the daily run: the config snapshot, then each mailbox's standing retention |
+| `purge.js` | no | the two-system delete: the R2 object first, then the rows that name it |
+| `retention.js` | yes | the period set, the cutoff, the selection predicate, the result shaping |
+| `health.js` | yes | the health document, `ok`, and the `degraded` sentences |
 | `loop-guard.js` | yes | `loopReason` (message level) and `memberSkip` (member level) |
 | `rules.js` | yes | mute rules: matching, normalising, validating, and the SQL predicate |
 | `fanout-status.js` | yes | classifying a fan-out error, and folding it onto a member row |
@@ -54,7 +62,9 @@ in `send.js`.
    returns `null` instead of throwing. `setReject` appears nowhere.
 2. **`compose.js` is unreachable from `email()`.** The `send_email` binding is unrestricted,
    so the control against "send to anyone" being inside the inbound path is the import graph,
-   not a comment.
+   not a comment. **The same holds for `scheduled()`**: a cron is an unauthenticated caller in
+   every sense that matters — nobody is behind it, nothing checked a JWT, and it fires whether
+   or not anyone is watching — so `scheduled.js` reaches neither `compose.js` nor `send.js`.
 
 Both are asserted by `test/structure.test.mjs` on every run.
 
@@ -67,7 +77,8 @@ schema:
 
 ```sql
 CREATE TABLE IF NOT EXISTS mailboxes (
-  address TEXT PRIMARY KEY, display_name TEXT, created_at INTEGER)
+  address TEXT PRIMARY KEY, display_name TEXT, created_at INTEGER,
+  retention_days INTEGER)
 
 CREATE TABLE IF NOT EXISTS members (
   mailbox TEXT, email TEXT, mode TEXT CHECK(mode IN ('forward','send')),
@@ -114,11 +125,17 @@ run in the same `blockConcurrencyWhile` as the original DDL:
   on this path, mail arriving at a Durable Object that cannot start. So the columns are read
   first with `PRAGMA table_info(messages)` and each `ALTER` is skipped if its column is there.
 
-The three columns (`list_id`, `hidden`, `muted_by`) are also in the `CREATE TABLE` above, so a
-**new** object gets them in one statement and an **existing** one is brought to the same shape by
-the guarded `ALTER`s; the two paths converge. Changes are additive only. Nothing is renamed,
-nothing is dropped, `NOT NULL` carries a `DEFAULT`, and there is no version number to get out of
-step with the code — the schema describes itself.
+The added columns (`messages.list_id`, `messages.hidden`, `messages.muted_by` and
+`mailboxes.retention_days`) are also in the `CREATE TABLE`s above, so a **new** object gets them
+in one statement and an **existing** one is brought to the same shape by the guarded `ALTER`s; the
+two paths converge. The `PRAGMA` is read per table, because more than one table now has columns
+added to it. Changes are additive only. Nothing is renamed, nothing is dropped, `NOT NULL` carries
+a `DEFAULT`, and there is no version number to get out of step with the code — the schema
+describes itself.
+
+`retention_days` is **nullable with no default**, and that is the load-bearing half of it: null
+means *keep forever*, which is what every mailbox did before the column existed. A migration that
+introduced a default would start deleting mail on deploy.
 
 Notes that are not obvious from the DDL:
 
@@ -141,6 +158,13 @@ Notes that are not obvious from the DDL:
 * **`hidden` is a message property, `rules` is configuration.** A rule can be deleted without
   un-hiding anything, and a message can be un-hidden without touching the rule — which is why
   `muted_by` is nullable and cleared on an un-hide rather than being a foreign key.
+* **`retention_days` lives on the mailbox, so deleting the mailbox stops it.** The standing sweep
+  reads the `mailboxes` table; an address whose configuration has been removed is no longer in it,
+  and its mail stops being deleted rather than continuing to be deleted with nobody configured to
+  notice.
+* **Purging is the one place rows are removed** (`DELETE FROM messages` has exactly one call site,
+  asserted). It takes the `fanout_log` rows first — a fan-out row whose message is gone is an
+  orphan nothing can explain and nothing would find again.
 
 ## Request flow: inbound
 
@@ -157,7 +181,9 @@ Cloudflare Email Routing
                   firstMatch(rules, row)  a mute rule? → hidden=1, muted_by, hits+1,
                                           and NO members handed back
              4. fan out, OUTSIDE the DO
-                  loopReason(headers)     suppress the lot?  → one skip row
+                  loopReason(headers)     already auto-replied? → one skip row
+                                          (hop, Auto-Submitted, X-Autoreply /
+                                           X-Autorespond, Precedence)
                   muted_by                muted?             → one 'rule' row
                   memberSkip(...)         skip this member?  → one skip row
                   mode 'forward'          message.forward(member)
@@ -181,6 +207,13 @@ that thread, and every other mailbox's inbound message queues behind it. So:
 Which fixes the inbound path at exactly two DO calls: `inbound()` inserts the row and hands
 back the member list in one round trip, the worker performs the forwards and sends outside the
 object, and `recordFanout()` writes down what happened.
+
+**The retention sweep keeps the same discipline**, and it matters more there than anywhere else: an
+R2 delete is a network call, there can be 500 of them, and a purge that did them inside the object
+would hold its single thread while every mailbox's inbound mail queued behind it. So the object
+hands out `{id, r2_key, size}` rows, the worker deletes the objects, and a second call forgets the
+rows. `health()` is one call; `exportConfig()` is one call. The cron runs at 03:17 for the same
+reason — it is the quietest hour for the object's thread.
 
 **Mute rules are evaluated inside `inbound()`, and that is why the count is still two.** The
 call already knows the mailbox, has the row in hand and is about to return the member list, so
@@ -241,6 +274,69 @@ withMemberStatus(box)     pure: members + those rows → members[].last
 * **An `ok` row whose mode is `skip` is not drawn as "delivered".** `fanout_log` records skips
   as `ok=1`; claiming a delivery that never happened is the one lie worth avoiding here.
 
+## The loop guards
+
+Two guards, and the reason both are in a pure module is that getting one wrong does not produce a
+bug report — it produces a mail loop between this worker and somebody else's autoresponder, at
+machine speed, on a domain whose sending reputation everything else on the account depends on.
+
+`loopReason(headers)` suppresses the whole fan-out, in this order:
+
+| reason | what it is |
+|---|---|
+| `x-subetha-hop` | this worker's own mark on a copy it sent; outranks everything |
+| `auto-submitted:<value>` | RFC 3834, any value but `no` |
+| `x-autoreply` / `x-autorespond` | what autoresponders that predate the RFC stamp on their own output — any value |
+| `precedence:bulk\|junk\|list` | the old convention |
+
+**The question this predicate answers is "would forwarding this go round again", not "is this
+machine-generated".** That distinction is the whole design, and getting it wrong costs mail:
+
+* **A "do not auto-reply to me" marker is not a "do not forward me" marker.** A shared address
+  exists precisely to receive no-reply registration mail, notifications and receipts, and
+  forwarding one of those to a human member cannot loop — a person is not an autoresponder.
+* So **`X-Auto-Response-Suppress` is deliberately NOT a guard.** It is Exchange's, it means "do not
+  answer this automatically", and Exchange puts it on exactly the ordinary notification mail a
+  shared mailbox is meant to hand on.
+* And **the sender's local part is deliberately NOT a guard** either — `mailer-daemon`,
+  `postmaster`, `no-reply`, `noreply`, `do-not-reply`, `donotreply`, `bounce`, `bounces`. A machine
+  that will not answer back is a machine whose mail is safe to forward. Both of these were built,
+  tried, and removed; `test/loop-guard.test.mjs` asserts that neither suppresses, so the omissions
+  read as decisions rather than as gaps.
+* **`X-Autoreply` and `X-Autorespond` stay**, because they are a different sentence: an
+  autoresponder puts them on *its own output*, so the message in hand already **is** an automatic
+  reply, and a fan-out answers it five more times.
+* **Those two suppress on PRESENCE**, unlike `Auto-Submitted` — neither has a value meaning
+  "actually, a person wrote this", so there is no equivalent of `no` to honour. An empty value
+  reads as absent, exactly as `X-Subetha-Hop` does.
+* **`Auto-Submitted` is read before the pre-RFC spellings**, so a message carrying both is named in
+  the fan-out log by the standard header rather than by the legacy one.
+* **The accepted trade**: an autoresponder that marks itself with neither `Auto-Submitted` nor
+  `X-Autoreply` gets fanned out. That is the cheaper failure. The alternative — inferring from the
+  sender's address — silently swallowed registration mail, receipts and alerts, which is the mail
+  a shared address is for.
+* **`List-Id` is not a guard** for the related reason: a shared mailbox subscribing to a mailing
+  list is a normal thing to want, and muting a list is a *rule*, which is an owner's decision
+  rather than this worker's.
+
+`memberSkip(member, mailbox, routedDomains)` skips one member: the mailbox itself, or an address on
+a domain this worker routes (Email Routing would hand it straight back to `email()`, sub-second).
+
+### The stamp on a send-mode copy
+
+A send-mode fan-out copy carries `Auto-Submitted: auto-replied` as well as `X-Subetha-Hop: 1`. Two
+reasons, and the first is the one that matters:
+
+1. **It is true.** The copy is a machine re-sending somebody else's message, so a vacation
+   autoresponder on the far side must not answer it.
+2. **It closes the loop from the other end.** If the copy ever arrives back here, `loopReason()`
+   stops it on `Auto-Submitted` alone — even where an intermediary has dropped the `X-` header,
+   which is exactly the case a private marker cannot cover.
+
+**A reply or a compose from the UI carries neither.** A person wrote those, and marking them
+`auto-replied` tells the recipient's mail system to ignore a human answer. `test/structure.test.mjs`
+asserts that the stamp is on the fan-out's builder call and that `compose.js` never names it.
+
 ## Mute rules
 
 A shared mailbox accumulates mail nobody wants forwarded to five people: a newsletter somebody
@@ -258,8 +354,9 @@ The decisions worth writing down:
 
 * **Mute only.** A rule hides a message and stops its fan-out. It does not delete, move, tag or
   auto-reply. Everything is still archived to R2, still stored, still readable under *show
-  muted*, and still downloadable as the original `.eml`. "No message deletion" is a requirement,
-  not an oversight, and a rule that deleted would be the way round it.
+  muted*, and still downloadable as the original `.eml`. A rule that deleted would be the way round
+  the requirement, and it stays that way now that retention exists: a purge takes a mailbox and an
+  age, never a sender or a pattern, so "delete mail from this person" remains unexpressible.
 * **No regular expressions.** Four fields and two comparisons: equals (`from`, `from_domain`)
   and contains (`subject`, `list_id`). A pattern is typed into a small box by a person and then
   runs inside the Durable Object on the inbound path, where a typo becomes either a rule that
@@ -290,6 +387,150 @@ The decisions worth writing down:
   one team's attention. A message that trips both is recorded as suppressed.
 * **Rules apply to `direction='in'` only.** The mailbox's own outbound copies are not muted, and
   the retroactive `UPDATE` says so in its `WHERE`.
+
+## Health
+
+```
+GET /api/health
+  └─ stub.health()        ONE read-only DO call: nine aggregates
+     shapeHealth(raw)     pure: the document, `ok`, and the degraded sentences
+```
+
+```json
+{ "ok": true, "checked_at": 1700000000000,
+  "mailboxes": 3, "unconfigured_messages": 0,
+  "inbound_24h": 12, "outbound_24h": 1, "last_inbound_at": 1700000000000,
+  "fanout_failures_24h": 0, "archive_failures_24h": 0, "muted_24h": 0,
+  "degraded": [] }
+```
+
+* **`ok` is false for exactly two reasons**: `fanout_failures_24h > 0` or
+  `archive_failures_24h > 0`. A fan-out that did not arrive, and a message stored without its
+  archived copy. Both are silent otherwise and both are things an operator can fix.
+* **QUIET IS NOT DEGRADED.** No inbound mail is the normal state of most shared addresses, and an
+  install that has never received anything is new rather than broken. `last_inbound_at` is `null`
+  in that case, never `0` — `0` is a timestamp in 1970 and a caller that renders it says so.
+* **`degraded` is non-empty exactly when `ok` is false**, and it is short human sentences:
+  `"2 fan-out failures in 24h (1 member: unverified destination)"`,
+  `"1 message archived without R2 copy"`. The fan-out line says how many members and what *kind*,
+  using the same classifier the member rows use — the difference between "one address needs
+  verifying" and "the account is out of quota" is the difference between acting and waiting. It
+  never names an address: a health route answers anybody who may read it.
+* **Authenticated like every other route**, and named in the auth comment for that reason: a
+  health endpoint is the one route somebody eventually wants an exception for.
+* **Any authenticated identity may read it, and the numbers are account-wide.** It is deliberately
+  not owner-only — it leaks counts and nothing else, and a member watching a mailbox that has gone
+  quiet needs to tell "nothing arrived" from "nothing works". There is no per-identity health.
+* **`mailboxes` counts CONFIGURED mailboxes**, unlike `GET /api/mailboxes`, which unions in
+  addresses that have only received or only been ruled on. Mail to an unclaimed address is counted
+  separately, in `unconfigured_messages`.
+* **A field without a window in its name is all-time.** `unconfigured_messages` is a standing
+  to-do, not an event; it does not stop being one after a day.
+* **`muted_24h` counts hidden by a rule and hidden by hand alike.** Both mean nothing was forwarded,
+  which is what the number is for, and the UI calls both "muted".
+* **The skip/rule exclusion on `fanout_failures_24h` is belt and braces.** Skips and mutes are
+  written `ok=1`, so excluding them by mode changes nothing today; it is there so a future row
+  written `ok=0` for "deliberately not sent" cannot turn a decision into a failure. A `NULL` mode
+  still counts — a failure with no mode is a failure.
+
+## Config export and the daily snapshot
+
+```
+GET /api/export          owner only          →  the document
+scheduled()  (03:17 UTC) →  the SAME document, to R2 under _config/
+```
+
+`stub.exportConfig()` is one read-only method with two callers, so the file in the bucket and the
+file behind the route cannot drift. It carries mailboxes, members and rules — and **no messages**:
+it is a configuration backup, the thing that is annoying to rebuild by hand, not the mail, which
+is already in R2 whole.
+
+* **Owner-only.** It is every mailbox, every member address and every rule in one response, which
+  is the member list's kind of question rather than the reader's.
+* **Two keys per run**: `_config/YYYY-MM-DD.json` is the history (a member removed by mistake three
+  weeks ago is still in one of them) and `_config/latest.json` is the one a restore script reads
+  without listing the bucket.
+* **The `_config/` prefix cannot collide with a mailbox's.** A mailbox key's first segment is an
+  email address, so it carries an `@` and `keySafe()` destroys any `/`; `r2Key()` also appends `_`
+  to a mailbox segment that is literally `_config`, so the exclusivity is a property of the code
+  rather than an argument about addresses. Asserted in `test/archive.test.mjs`.
+* **Addresses that only ever received mail are left out** — there is nothing configured about them
+  to restore. An address that has only *rules* is kept, with a null display name, because a rule is
+  configuration and an export that dropped some would be a backup with a hole in it.
+* **`retention_days` is deliberately NOT in the export.** The document's shape is a contract that
+  predates the field, and adding to it is a change for the caller who owns that contract to ask
+  for. Noted here rather than left to be discovered: a restore from a snapshot does not restore
+  retention, and that fails in the safe direction — a restored mailbox keeps its mail.
+* **`scheduled()` never throws**, and its two halves are wrapped separately: a bucket that refuses
+  the snapshot must not also cost the mailboxes their retention, and the reverse.
+
+## Storage and retention
+
+Every mailbox row — in the list and in `GET /api/mailboxes/:address` — carries:
+
+```json
+"storage": { "messages": 412, "bytes": 9184233, "oldest_at": 1690000000000 }
+```
+
+`bytes` is the sum of the stored `size` column, both directions. **R2's usage for the same mailbox
+is close to this and not identical**: a message whose archive failed has a `size` and no object, an
+object carries its own metadata, and an outbound row's `size` is the length of the MIME this worker
+built rather than what the receiving server stored. It is the right number for "is this mailbox
+getting large", and the wrong one to reconcile a bill against.
+
+Deleting is two paths and **one mechanism**:
+
+```
+POST /api/mailboxes/:address/purge  {older_than_days}   owner only, ?dry_run=1
+scheduled()  →  mailboxes.retention_days                the same call, once a day
+```
+
+```
+purgeOlderThan(env, stub, address, days, dryRun)      purge.js
+  cutoffAt(days, now)                                 retention.js (pure)
+  dry run → stub.purgePreview()                       COUNT + SUM, nothing touched
+  otherwise:
+    stub.purgeCandidates(address, cutoff, 500)        id, r2_key, size — oldest first
+    env.MAIL.delete(r2_key)  per row                  R2 FIRST
+      failed?  → skip this row, count it, keep the message whole
+    stub.purgeRows(address, ids)                      fanout_log rows, then messages
+  purgeSummary(gone, failed)  →  {deleted, bytes, r2_failed}
+```
+
+The decisions worth writing down:
+
+* **Hard delete, and deliberately so.** "No message deletion" was a promise about what *SubEtha*
+  does on its own; it is not a promise that an owner may never remove their own mail. A purge is
+  the owner's explicit act, with the count in front of them before it runs — not a silent drop.
+  Everything else in the product still refuses to delete: a mute hides, removing a mailbox keeps
+  its messages, and a rule has no action that approximates one.
+* **R2 first, then the rows.** A row whose object is gone still says so (`r2_key` points at
+  nothing and the UI stops offering the download); an object whose row is gone is an orphan nobody
+  can find, name or bill. So a failed R2 delete **skips its row**: the message stays whole and the
+  next run tries again, which is why `r2_failed` is in the answer rather than only in a log.
+* **The period is one of five**, not a number of days. `older_than_days: 1` is a plausible slip for
+  `365` and it would take the mailbox with it. Validated in one pure place, for both callers, and
+  validated **again** on the way out of the database by the scheduled sweep — the stored value
+  decides what is deleted with nobody watching.
+* **Both directions, strictly older.** An outbound reply is as old as the message it answered;
+  keeping one half of a thread is a history that reads as if nobody ever replied. A message exactly
+  on the cutoff is kept — the boundary moves with the clock, and the one direction to round in is
+  the one that keeps mail.
+* **Age is the only question.** Not hidden, not unconfigured, not read: a purge that also weighed
+  those would be a second mute wearing a different word.
+* **500 messages per call.** An R2 delete is a subrequest and a Worker has a fixed budget of them;
+  a mailbox with a year of mail would spend the lot and fail halfway, which on this path means
+  objects deleted whose rows survived. The rest goes on the next run — the sweep is daily and the
+  owner's button can be pressed again. The UI says so when it happens, by comparing what went with
+  what the dry run counted.
+* **The dry run counts everything older than the cutoff**, not just the batch, because it is what
+  the confirm step shows a person — and it answers with `dry_run: true`, so a caller cannot
+  mistake a rehearsal for the real thing or the real thing for a rehearsal.
+* **Retention absent means keep forever.** `PUT /api/mailboxes/:address` posts the whole
+  configuration, so a client that has never heard of `retention_days` turns a standing deletion
+  **off** rather than leaving one running that it cannot see. That is the safe direction: the
+  failure mode is mail accumulating, not mail disappearing.
+* **Deleting a mailbox stops its retention**, because the sweep reads the `mailboxes` table.
 
 ## Request flow: reply (and compose)
 
@@ -408,11 +649,14 @@ Two roles and no third, decided by `perm.js` and enforced on the server by every
 | listed in `OWNERS`, or the `ADMIN_SECRET` bearer | yes | — | — |
 | on some mailbox's `members`, either mode | — | yes | — |
 | `GET /` | shell | shell | shell, empty list |
+| `GET /api/health` | counts | the same counts | the same counts |
 | `GET /api/mailboxes` | every mailbox | only its own | `[]` |
+| `GET /api/mailboxes/:address` | any mailbox | its own | 403 |
 | read, download raw, reply, compose | any mailbox | its own | 403 |
 | see a mailbox's mute rules | any mailbox | its own | 403 |
-| create / edit / delete a mailbox, edit members | yes | 403 | 403 |
+| create / edit / delete a mailbox, edit members, set retention | yes | 403 | 403 |
 | create or delete a mute rule; hide or un-hide a message | yes | 403 | 403 |
+| `GET /api/export`; purge a mailbox's old mail | yes | 403 | 403 |
 
 Identity is the Access JWT's `email` claim, lowercased. `identity === "bearer"` is
 owner-equivalent: it is the operator's own automation credential and could already reach every
@@ -425,6 +669,11 @@ for one provider is wrong for the next — and being wrong here hands over a mai
 `GET /api/mailboxes` and `GET /api/me` are identity-scoped reads and return an empty list / an
 `is_owner: false` rather than 403, which is what lets the shell render "you are on no mailbox"
 instead of a bare error. Everything that names a mailbox or a message is 403.
+
+`GET /api/health` names no mailbox and is answered for every authenticated identity, with
+account-wide numbers. It is the one route that is neither identity-scoped nor gated, and the reason
+is that there is no per-identity answer to "is this install working": a member whose own mailbox is
+fine while another silently fails would be told "ok". It carries counts and no addresses.
 
 An **unconfigured** mailbox has no `mailboxes` row and therefore no members, so only an owner can
 see it. That is the right answer: mail that arrived at an address nobody has claimed is the
@@ -456,6 +705,11 @@ The object carries `contentType: message/rfc822` and custom metadata (`mailbox`,
 `direction`, `at`). `archive()` never throws: a failed put is logged and the row is stored
 with `r2_key = null`, which is how the UI knows there is no archived copy to download.
 
+One other thing lives in the bucket: `_config/YYYY-MM-DD.json` and `_config/latest.json`, the daily
+configuration snapshot, written by `putJson()` with `contentType: application/json` and no custom
+metadata — there is no sender and no mailbox to put in it. The prefix is exclusive by construction;
+see *Config export and the daily snapshot*.
+
 ## Auth ordering
 
 In `route()`, in this order, before the path is examined:
@@ -468,7 +722,10 @@ In `route()`, in this order, before the path is examined:
    for a service token). Verification checks `iss` against `ACCESS_TEAM_DOMAIN`, `exp`,
    `aud` against `ACCESS_AUD` — required, never optional — and the RSA signature against the
    team's published keys, cached for an hour.
-3. No identity → `401`. There is no unauthenticated route, not even a health check.
+3. No identity → `401`. There is no unauthenticated route — `GET /api/health` included, and it is
+   named in the code comment for exactly that reason: a health endpoint is the one route somebody
+   eventually wants an exception for, and a worker that can send mail as any mailbox in the zone has
+   nothing safe to say to an anonymous caller, not even how busy it has been.
 
 `test/structure.test.mjs` asserts that nothing returns a `Response` above the gate.
 
