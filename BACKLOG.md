@@ -7,7 +7,7 @@
 - [x] `GET /api/health` (watched by the operator's monitor); `GET /api/export` + daily `_config/` snapshot to R2; storage counter, one-shot purge with dry-run, standing `retention_days`; loop-guard corrections. 159 tests. Live 2026-09-13.
 - [x] Design pass ("pleasing, comfortable, fine"), inline-SVG favicon, dark mode opt-in only. Live 2026-09-13.
 - [x] Deliberate delete (Danger block, typed confirm), forward-mode warning until first delivery, icon theme toggle. Live 2026-09-13.
-- [ ] **Skin to the owner's Claude Design board "2b"** (one container/one left edge, near-white ground, eclipse mark + serif wordmark, serif only for wordmark/pane titles/subject, Reply and Compose both accent-filled, "2 attachments" as text, ruled storage block). Fold in: warning stays for members whose only fan-out row is a skip (`last.ok && last.mode !== "skip"`); AGENTS.md test count 159 → 175.
+- [x] Skinned to design board "3a" (2b + five pushes); subtitle "Email Routing, extended."; danger block at page bottom; skip-warning fold-in; network-free page asserted. 181 tests. Live 2026-09-13.
 - [ ] Publish decision: flip the GitHub repo public once the README reads right; keep Issues/PRs enabled.
 - [ ] Operators embedding this in a private infrastructure repo: keep your real `wrangler` config **outside** the copy/subtree so upstream merges never conflict on vars.
 
