@@ -29,6 +29,30 @@ const CSP = (img) => `<meta http-equiv="Content-Security-Policy" content="defaul
 // the only icon link on the page — one SVG scales, and a second link is a size negotiation.
 const FAVICON = "%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%235980a6%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Crect%20x%3D%222%22%20y%3D%224%22%20width%3D%2215%22%20height%3D%2211.5%22%20rx%3D%222%22%2F%3E%3Cpath%20d%3D%22M3.5%205.4%209.5%209.9%2015.5%205.4%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke%3D%22%23ffffff%22%20stroke-width%3D%225%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke-width%3D%222.4%22%2F%3E%3C%2Fsvg%3E";
 
+// The two rules on this page worth asserting, kept here as ordinary exported functions and
+// interpolated into the client script below as source. The suite imports them from this module
+// and asserts on them directly, so the rule that is TESTED is the rule that RUNS — a hand-copied
+// second version in the client script is a second version to get wrong. Keep them ES5 and free
+// of template literals, for the reason the banner at the top of this file gives.
+
+// The typed confirmation that arms the one destructive control in the settings. Case-insensitive
+// because an address is, trimmed because a pasted one carries whitespace, and false for an empty
+// address so a page with no mailbox selected cannot arm it by typing nothing.
+export function confirmsDelete(typed, address) {
+  var a = String(address == null ? "" : address).trim().toLowerCase();
+  var t = String(typed == null ? "" : typed).trim().toLowerCase();
+  return a !== "" && t === a;
+}
+
+// Forward mode delivers only to an address Cloudflare has verified as a destination, and an
+// unverified one fails silently for that member while the others still get their copy. Nothing
+// on the page can know whether an address is verified — only a delivery can — so the warning is
+// on until a delivery says otherwise: no status yet, or a failed one, means still unproven.
+export function needsForwardWarning(member) {
+  if (!member || member.mode !== "forward") return false;
+  return !(member.last && member.last.ok);
+}
+
 export function renderUi({ identity } = {}) {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SubEtha</title>
@@ -48,7 +72,7 @@ try { if (localStorage.getItem("subetha-theme") === "dark") document.documentEle
   <div class="head">
     <h1>SubEtha</h1>
     <span class="grow"></span>
-    <label class="opt"><input type="checkbox" id="dark"> dark</label>
+    <button id="theme" class="icon" aria-label="Toggle dark theme" title="Toggle dark theme"></button>
     <span class="who" id="who">${esc(identity || "")}</span>
   </div>
   <div class="row">
@@ -61,10 +85,7 @@ try { if (localStorage.getItem("subetha-theme") === "dark") document.documentEle
       <label class="lbl" for="dn">display name</label>
       <input type="text" id="dn" class="grow" placeholder="Support" style="max-width:260px">
     </span>
-    <span class="grp">
-      <button id="save" class="primary">Save</button>
-      <button id="del">Delete mailbox</button>
-    </span>
+    <button id="save" class="primary">Save</button>
     <span class="grow"></span>
     <button id="compose" class="primary">Compose…</button>
   </div>
@@ -74,6 +95,7 @@ try { if (localStorage.getItem("subetha-theme") === "dark") document.documentEle
     <span class="note">forward requires a verified destination address on the account;
       send arrives from the mailbox address and uses the sending quota</span>
   </div>
+  <div class="warn" id="fwdnotice"></div>
   <table class="members"><tbody id="rules"></tbody></table>
   <div class="row"><span class="note" id="rulesnote"></span></div>
   <div class="row" id="storagerow">
@@ -89,6 +111,19 @@ try { if (localStorage.getItem("subetha-theme") === "dark") document.documentEle
       <option value="365">365 days</option>
     </select>
     <button id="purge">Delete older than…</button>
+  </div>
+  <div class="danger" id="dangerzone">
+    <button id="delstart">Delete mailbox…</button>
+    <div id="delconfirm" hidden>
+      <p class="warn" id="delwhat"></p>
+      <div class="row">
+        <label class="dl" for="delconf">Type the address to confirm</label>
+        <input type="text" id="delconf" class="grow" autocomplete="off" autocapitalize="off"
+               spellcheck="false" style="max-width:320px">
+        <button id="del" class="destructive" disabled>Delete</button>
+        <button id="delcancel">Cancel</button>
+      </div>
+    </div>
   </div>
   <div class="err" id="cfgerr"></div>
 </div>
@@ -162,12 +197,21 @@ var boxes = [], cur = null, msgs = [], sel = null, oldest = 0, showHtml = false,
 // hidden mail is left out of the response until it is asked for by name.
 var rules = [], showMuted = false;
 var RULES_EMPTY = "No mute rules. Open a message and use “Mute…” to stop forwarding mail like it — it is still archived and still stored, just not sent on.";
+// The member addresses the current configuration was DRAWN from, lowercased. Two things read
+// it: the delete confirmation, which states how many members go, and the save, which says which
+// forward members are new and therefore have never been proved to deliver.
+var loadedMembers = [];
 // Set from GET /api/me. It decides what this PAGE draws and nothing else — every route
 // checks the same question again on the server, because a hidden button is not a permission.
 var isOwner = false;
 var PIXEL = ${JSON.stringify(PIXEL)};
 var CSP_BLOCKED = ${JSON.stringify(CSP("data:"))};
 var CSP_REMOTE = ${JSON.stringify(CSP("data: https:"))};
+
+// ---- the asserted rules ------------------------------------------------
+// Interpolated as source from this module's own exports, for the reason given up there.
+${confirmsDelete}
+${needsForwardWarning}
 
 // ---- mailbox configuration --------------------------------------------
 // What the last fan-out to this member did. A forward to an address that is not a verified
@@ -208,8 +252,29 @@ function memberRow(email, mode, last) {
     '<label><input type="radio" class="m-snd" name="' + nm + '"' + (mode === "send" ? " checked" : "") + '> send</label></td>' +
     "<td>" + memberStat(last) + "</td>" +
     '<td><button class="link m-del">remove</button></td>';
-  tr.querySelector(".m-del").onclick = function () { tr.remove(); };
+  // The note under a row belongs to it: removing the row removes the note, or the next row
+  // inherits a warning about an address that is no longer there.
+  tr.querySelector(".m-del").onclick = function () {
+    var next = tr.nextElementSibling;
+    if (next && next.className === "m-warn") next.remove();
+    tr.remove();
+  };
   return tr;
+}
+// A row of its own rather than a line in the status cell: the sentence is longer than the column
+// and it is about the whole member, not about that one cell.
+function warnRow() {
+  var tr = document.createElement("tr");
+  tr.className = "m-warn";
+  tr.innerHTML = '<td colspan="4"><span class="warn">&#9888; Forward only reaches addresses ' +
+    "verified under Cloudflare Email Routing → Destination addresses; unverified ones fail " +
+    "silently. If unsure, choose send.</span></td>";
+  return tr;
+}
+// One member, and the note beneath it when the rule says so.
+function appendMember(tb, m) {
+  tb.appendChild(memberRow(m.email, m.mode, m.last));
+  if (needsForwardWarning(m)) tb.appendChild(warnRow());
 }
 function readMembers() {
   var out = [];
@@ -248,8 +313,40 @@ function showConfig(b) {
   showStorage(b);
   var tb = el("members"); tb.innerHTML = "";
   var ms = (b && b.members) || [];
-  for (var i = 0; i < ms.length; i++) tb.appendChild(memberRow(ms[i].email, ms[i].mode, ms[i].last));
-  if (!ms.length && isOwner) tb.appendChild(memberRow("", "forward"));
+  loadedMembers = [];
+  for (var i = 0; i < ms.length; i++) {
+    loadedMembers.push(String(ms[i].email || "").trim().toLowerCase());
+    appendMember(tb, ms[i]);
+  }
+  if (!ms.length && isOwner) appendMember(tb, { email: "", mode: "forward", last: null });
+  // Both of these are about the configuration that was just replaced, so neither survives it.
+  el("fwdnotice").textContent = "";
+  closeDelete();
+}
+// ---- deleting a mailbox's configuration --------------------------------
+// Not behind a confirm() an operator dismisses by reflex: the button opens a sentence saying what
+// goes and what does not, and the Delete stays disabled until the address is typed out. The
+// sentence matters more than the typing — "delete mailbox" reads like "delete the mail", and this
+// deletes no mail at all.
+function openDelete() {
+  if (!cur) return toast("No mailbox selected");
+  var n = loadedMembers.length;
+  el("delwhat").textContent = "Removes this mailbox's configuration and all " + n +
+    (n === 1 ? " member" : " members") + ". Forwarding stops immediately. Stored messages and " +
+    "rules are kept and reappear if the address is recreated.";
+  el("delconf").value = "";
+  el("delconf").placeholder = cur;
+  el("del").disabled = true;
+  el("delconfirm").hidden = false;
+  el("delstart").hidden = true;
+  el("delconf").focus();
+}
+function closeDelete() {
+  if (!el("delconfirm")) return;
+  el("delconfirm").hidden = true;
+  el("delstart").hidden = false;
+  el("delconf").value = "";
+  el("del").disabled = true;
 }
 // Deleting mail is the one irreversible thing in SubEtha, so it is two steps and the second one
 // states a number the SERVER counted: the dry run asks what would go, and only what comes back
@@ -342,7 +439,8 @@ async function removeRule(id) {
 function applyRole() {
   // storagerow goes whole: retention and the purge button are owner-only, and a storage line on
   // its own, under two controls a member cannot use, is a line asking a question it cannot answer.
-  var ids = ["newbox", "save", "del", "addmember", "storagerow"];
+  // dangerzone likewise carries the delete button, so the button is gated by gating the block.
+  var ids = ["newbox", "save", "addmember", "storagerow", "dangerzone"];
   for (var i = 0; i < ids.length; i++) if (el(ids[i])) el(ids[i]).style.display = isOwner ? "" : "none";
   el("dn").disabled = !isOwner;
   el("who").textContent = el("who").textContent + (isOwner ? " · owner" : "");
@@ -618,15 +716,16 @@ function composeModal() {
 // ---- wiring ------------------------------------------------------------
 // A page preference, not mailbox configuration: it never goes near the server, it belongs to
 // this browser alone, and the attribute it sets is the ONLY thing that makes the page dark.
-el("dark").checked = document.documentElement.getAttribute("data-theme") === "dark";
-el("dark").onchange = function () {
-  var on = el("dark").checked;
+// The button carries no text of its own — the moon and the sun are drawn by CSS off the same
+// attribute, so the glyph is already right at first paint and there is nothing here to sync.
+el("theme").onclick = function () {
+  var on = document.documentElement.getAttribute("data-theme") !== "dark";
   if (on) document.documentElement.setAttribute("data-theme", "dark");
   else document.documentElement.removeAttribute("data-theme");
   try { localStorage.setItem("subetha-theme", on ? "dark" : "light"); } catch (e) {}
 };
 el("box").onchange = async function () { cur = el("box").value; showConfig(boxes.filter(function (b) { return b.address === cur; })[0]); await loadRules(); await loadMessages(true); };
-el("addmember").onclick = function () { el("members").appendChild(memberRow("", "forward")); };
+el("addmember").onclick = function () { appendMember(el("members"), { email: "", mode: "forward", last: null }); };
 el("onlyunconf").onchange = renderList;
 // Unlike "unconfigured only", this one refetches: hidden mail is not in the page to filter.
 el("showmuted").onchange = function () {
@@ -646,19 +745,37 @@ el("newbox").onclick = function () {
 };
 el("save").onclick = async function () {
   el("cfgerr").textContent = "";
+  var members = readMembers();
+  // Worked out BEFORE the save, because loadBoxes() below redraws from the server's answer and
+  // takes loadedMembers with it. A forward address nobody has delivered to yet is the case the
+  // warning under the row is about, and this is the same thing said once, after the fact.
+  var fresh = members.filter(function (m) {
+    return m.mode === "forward" && loadedMembers.indexOf(m.email) < 0;
+  });
   try {
     // Retention goes with the save because it is configuration, not an action: the PUT carries
     // the whole of it, and an empty select is null — keep forever.
     await api("/api/mailboxes/" + encodeURIComponent(cur), { method: "PUT", body: {
-      display_name: el("dn").value, members: readMembers(),
+      display_name: el("dn").value, members: members,
       retention_days: el("ret").value ? Number(el("ret").value) : null } });
     toast("Saved"); await loadBoxes(cur);
+    el("fwdnotice").textContent = fresh.length
+      ? fresh.length + " forward member" + (fresh.length === 1 ? "" : "s") +
+        " unverified until their first delivery — check the row status after the next inbound message."
+      : "";
   } catch (e) { el("cfgerr").textContent = String(e.message || e); }
 };
+el("delstart").onclick = openDelete;
+el("delcancel").onclick = closeDelete;
+el("delconf").oninput = function () { el("del").disabled = !confirmsDelete(el("delconf").value, cur); };
 el("del").onclick = async function () {
-  if (!cur || !confirm("Remove the configuration for " + cur + "? Stored messages are kept.")) return;
-  try { await api("/api/mailboxes/" + encodeURIComponent(cur), { method: "DELETE" }); toast("Deleted"); await loadBoxes(null); }
-  catch (e) { el("cfgerr").textContent = String(e.message || e); }
+  // Asked again here rather than trusted from the disabled attribute: the attribute is what the
+  // operator sees, and this is what actually decides.
+  if (!confirmsDelete(el("delconf").value, cur)) return;
+  try {
+    await api("/api/mailboxes/" + encodeURIComponent(cur), { method: "DELETE" });
+    toast("Deleted"); closeDelete(); await loadBoxes(null);
+  } catch (e) { el("cfgerr").textContent = String(e.message || e); }
 };
 
 // /api/me first: what this page draws depends on the answer, and drawing the editor for

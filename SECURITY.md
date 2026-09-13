@@ -83,7 +83,9 @@ Three things about this are load-bearing:
 1. **It is enforced on the server, on every route.** The UI hides what a member cannot use, and
    that is presentation only — a hidden button is not a permission. `test/structure.test.mjs`
    asserts that every mutating mailbox route calls the admin check and that every route naming a
-   mailbox or a message calls the view check.
+   mailbox or a message calls the view check. The same goes for the typed confirmation in front
+   of the mailbox delete: it guards an owner against their own reflex, not the route against a
+   caller, and `DELETE /api/mailboxes/:address` asks `canAdmin()` whatever the page did.
 2. **Comparison is lowercase and otherwise literal.** Gmail dots and `+tags` are deliberately
    **not** normalised: two different strings are two different identities, and an
    address-equivalence rule that is right for one provider is wrong for the next. Being wrong

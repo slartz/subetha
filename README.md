@@ -102,6 +102,17 @@ address-equivalence rule that is right for one provider is wrong for the next.
 a shared mailbox is for and why editing the list is owner-only. The UI hides what a member cannot
 use; that is presentation, and every route asks the same question again on the server.
 
+Two things on the page are deliberately slower than a click:
+
+* **Deleting a mailbox** is at the bottom of the settings, behind its own button, and the Delete
+  is disabled until the address is typed out. The block states what goes — the configuration and
+  all N members, forwarding stops immediately — and what stays: the stored messages, their
+  archived copies and the mute rules, which all reappear if the address is configured again.
+* **A `forward` member that has never delivered** carries an amber note saying so. Forward only
+  reaches an address verified under Cloudflare Email Routing → Destination addresses, an
+  unverified one fails silently for that member, and nothing but a delivery can tell the page
+  which it is. The note goes when the row shows a delivery.
+
 ## Reading a message
 
 The message pane shows **HTML by default** when the message has an html part, with a toggle to
@@ -520,9 +531,10 @@ See `SECURITY.md` for the full threat model.
 node --test test/*.test.mjs
 ```
 
-**159 tests, no dependencies and no test runner to install** — `node:test`, `node:assert` and
+**175 tests, no dependencies and no test runner to install** — `node:test`, `node:assert` and
 nothing else. The suite covers the body parser, the MIME builder, the loop guards, the health
-document, the retention predicate, the R2 key shape, and the structural wall around `compose.js`.
+document, the retention predicate, the R2 key shape, the page's two client-side rules, and the
+structural wall around `compose.js`.
 See `TESTS.md` for what each file covers and what is not covered.
 
 ## Status

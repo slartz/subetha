@@ -10,7 +10,7 @@ From the project root, with any Node that has `node:test` (18+). **No dependenci
 to install** — `node:test`, `node:assert/strict`, `node:fs`, `node:path`, `node:url` and
 nothing else. There is no test runner, no config file, and no build step.
 
-Expected: **159 tests, 159 pass, 0 fail.**
+Expected: **175 tests, 175 pass, 0 fail.**
 
 Run one file while working on it:
 
@@ -25,6 +25,7 @@ node --test test/build-mime.test.mjs
 | `test/html-render.test.mjs` | 26 | the reader's HTML pass and the reply quote |
 | `test/build-mime.test.mjs` | 25 | the RFC 5322 builder, and the send-mode copy's sender |
 | `test/structure.test.mjs` | 21 | the structural invariants — read on |
+| `test/ui.test.mjs` | 16 | the page's two client-side rules, and that the page uses them |
 | `test/loop-guard.test.mjs` | 14 | both loop predicates, including the branches that must NOT fire |
 | `test/fanout-status.test.mjs` | 13 | the delivery-error classifier and the member-row shaping |
 | `test/parse-mail.test.mjs` | 13 | the body parser and the one text derivation |
@@ -33,6 +34,22 @@ node --test test/build-mime.test.mjs
 | `test/perm.test.mjs` | 10 | the permission predicate: owner, member, stranger, bearer |
 | `test/archive.test.mjs` | 8 | the R2 key shape, its sanitising, and the config-snapshot prefix |
 | `test/retention.test.mjs` | 8 | the purge period set, the cutoff, the selection predicate, the summaries |
+
+**`ui.test.mjs`** — the page is a string, and almost all of it is only verified by the smoke
+test. Two rules inside it are not, because getting either wrong is silent: `confirmsDelete()`,
+which arms the mailbox delete, and `needsForwardWarning()`, which decides whether a member row
+carries the note about unverified destination addresses. Both are exported from `ui.js` and
+**interpolated into the client script as source**, so there is one copy and the suite asserts the
+text the browser runs; the last three tests exist to keep that true — that both functions reach
+the page, that the delete path asks `confirmsDelete()` again on the click rather than trusting the
+disabled attribute and never reaches a `window.confirm`, and that the delete button sits inside
+the block `applyRole()` hides from a member.
+
+One of these encodes a decision rather than a fact. A `skip` is recorded in `fanout_log` as
+`ok=1` although nothing was sent, so by the rule as written — `last.ok`, and nothing finer — a
+member whose only fan-out row is a skip stops being warned about without any delivery having
+proved the address. `DESIGN.md` is explicit that a skip is not drawn as "delivered" elsewhere on
+the row, so the two readings are worth reconciling; the test says plainly which one is in force.
 
 **`build-mime.test.mjs`** — two of these are security tests and the rest correctness. Header
 injection through the Subject and through the display name is neutralised; an invalid address
@@ -281,8 +298,11 @@ Be honest about the shape of the hole:
 * **No HTTP routing.** `route()` is read by `structure.test.mjs` but never called; status
   codes, body validation and error mapping are untested.
 * **No UI behaviour.** `ui.js` and `theme.js` produce a string; `structure.test.mjs` asserts a
-  few properties of that string (the sandbox, the CSP, the remote-image flag) but nothing runs
-  it in a browser. The member-status cell, the mute chooser and the rules table are drawn by
+  few properties of that string (the sandbox, the CSP, the remote-image flag) and `ui.test.mjs`
+  asserts the two rules it exports, but nothing runs it in a browser. There is no DOM in the
+  suite, so the wiring around those rules — that the note is appended under the right row, that
+  the input enables the button, that `applyRole()` actually hides the block it is told to — is
+  read, not executed. The member-status cell, the mute chooser and the rules table are drawn by
   that client script and are exercised only by the smoke test.
 * **No `compose.js` behaviour.** Only its position in the import graph and, structurally, that
   it passes an html alternative exactly when the original had one. It imports `send.js`, which

@@ -48,7 +48,7 @@ index.js ──┬─ inbound.js ──┬─ archive.js ──── R2
 | `html-render.js` | yes | the HTML pass: `cid:` inlining, remote-image blocking, sanitising, the reply quote |
 | `perm.js` | yes | `canAdmin` / `canView` / `visibleMailboxes` — the permission predicate |
 | `access.js` | no | Access JWT extraction and verification |
-| `ui.js` / `theme.js` | yes | the page as one string: markup + inline CSS + inline JS |
+| `ui.js` / `theme.js` | yes | the page as one string: markup + inline CSS + inline JS, plus the two client-side rules it exports for the suite |
 
 Purity is not aesthetic: a module that imports `cloudflare:*` cannot be loaded by `node --test`,
 so every decision worth asserting lives in a module that does not. `test/structure.test.mjs`
@@ -273,6 +273,13 @@ withMemberStatus(box)     pure: members + those rows → members[].last
   the hint, always — the hint says what to *do*, not what happened.
 * **An `ok` row whose mode is `skip` is not drawn as "delivered".** `fanout_log` records skips
   as `ok=1`; claiming a delivery that never happened is the one lie worth avoiding here.
+* **The row also says it *before* the first failure.** `last` can only describe a delivery that
+  has been attempted, and the case an owner actually hits is a `forward` member that has never
+  been tried — no error to show, and no mail arriving either. `needsForwardWarning()` puts an
+  amber note under any forward row whose `last` is absent or not `ok`, naming where destination
+  addresses are verified and offering `send` as the way out. Saving a configuration that adds a
+  forward member says the same thing once more, as a line under the member table, because the
+  row it refers to will not change until the next inbound message.
 
 ## The loop guards
 
@@ -686,6 +693,32 @@ on the other end.
 The UI asks `GET /api/me` once and hides what a member cannot use. **That is presentation, not
 permission**: every route asks `perm.js` the same question again, and
 `test/structure.test.mjs` asserts that each one does.
+
+### The page's own two rules
+
+`ui.js` exports two pure predicates and interpolates them into the client script **as source**,
+so the rule the suite asserts is the text the browser runs rather than a second copy of it:
+
+| | |
+|---|---|
+| `confirmsDelete(typed, address)` | the typed confirmation that arms the mailbox delete |
+| `needsForwardWarning(member)` | whether a forward member has yet to be proved deliverable |
+
+* **`confirmsDelete` guards against reflex, not against an attacker.** Deleting a mailbox's
+  configuration is one `DELETE`, and that route asks `canAdmin()` like every other mutating route;
+  the typed address only decides whether the button in front of it is enabled. A `confirm()` is
+  dismissed by muscle memory — typing out `support@example.com` is not. Comparison is trimmed and
+  lowercased, and an empty address never arms it, because the page can be drawn with no mailbox
+  selected and `"" === ""` would be a live delete button on an empty form.
+* **The block it lives in says what the delete does *not* do.** "Delete mailbox" reads like
+  "delete the mail", and it deletes none: the configuration and the member list go and forwarding
+  stops, while the stored messages, their archived copies and the mute rules stay — and reappear
+  if the address is configured again. That sentence, with the member count in it, is the reason
+  the block exists; the typing is the smaller half.
+* **`needsForwardWarning` stays on until a delivery says otherwise.** Nothing on the page can
+  know whether an address is a verified destination — only a delivery can — so `last.ok` is the
+  whole rule, including for a `skip`, which is recorded `ok=1` with nothing having been sent.
+  See the note in `TESTS.md`.
 
 ## R2 key shape
 

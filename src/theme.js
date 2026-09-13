@@ -134,14 +134,19 @@ kbd {
   --bg: #f3f2f0; --head: #edecea; --surface: #e8e7e4;
   /* failure, as one token: #b00 is unreadable on a dark panel and was written out five times */
   --bad: #b00000; --bad-t: color-mix(in srgb, #b00000 12%, transparent);
+  /* caution — a fifth hue, and the only one that is not derived off the accent. It is for the
+     one thing the page cannot check for itself: whether a forward address is verified. */
+  --warn: #8a5f0a; --warn-t: color-mix(in srgb, #b8860b 13%, transparent);
   /* ink for text ON the accent: white in light, where the accent is dark — and the reverse in
-     dark, where the accent is a pale blue and white on it is not text, it is a smudge */
-  --on-accent: #ffffff;
+     dark, where the accent is a pale blue and white on it is not text, it is a smudge. The
+     destructive button has the same problem with the same answer. */
+  --on-accent: #ffffff; --on-bad: #ffffff;
 }
 :root[data-theme="dark"] {
   --bg:#191918; --panel:#1f1f1e; --head:#262624; --surface:#222221;
   --bad:#e79a9a; --bad-t: color-mix(in srgb, #e79a9a 14%, transparent);
-  --on-accent: var(--accent-900);
+  --warn:#dfb160; --warn-t: color-mix(in srgb, #dfb160 14%, transparent);
+  --on-accent: var(--accent-900); --on-bad: #2a1212;
 }
 
 /* ── the bar ── */
@@ -197,6 +202,19 @@ button.primary:hover { background: var(--accent-700); border-color: var(--accent
 button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 button:disabled:hover { background: var(--panel); border-color: var(--hair); }
 button.primary:disabled:hover { background: var(--accent); border-color: var(--accent); }
+/* The destructive button is the only filled red on the page, and it exists in exactly one
+   place. Disabled is its resting state: it is armed by typing, not by aiming. */
+button.destructive { background: var(--bad); border-color: var(--bad); color: var(--on-bad); }
+button.destructive:hover { background: color-mix(in srgb, var(--bad) 82%, #000);
+                           border-color: color-mix(in srgb, var(--bad) 82%, #000); }
+button.destructive:disabled:hover { background: var(--bad); border-color: var(--bad); }
+/* The toggle carries no text: the moon and the sun are drawn below off data-theme itself, so
+   the glyph is right at first paint and no script has to catch up with it. */
+button.icon { background: none; border-color: transparent; box-shadow: none; color: var(--lo2);
+              padding: 3px 7px; font-size: 14px; line-height: 1.2; }
+button.icon:hover { background: var(--hover); border-color: var(--hair); color: var(--ink); }
+#theme::before { content: "\\263E"; }
+:root[data-theme="dark"] #theme::before { content: "\\2600"; }
 button.link { background: none; border: none; box-shadow: none; color: var(--accent-700);
               padding: 2px 6px; border-radius: var(--rad-sm); }
 button.link:hover { background: var(--hover); color: var(--accent-800); border-color: transparent; }
@@ -279,9 +297,12 @@ iframe.html { width: 100%; height: 460px; border: 1px solid var(--hair); border-
 .members tr.m-skip > td:first-child { border-left-color: var(--i); }
 /* Four columns, sized rather than left to whatever the longest address happens to be: the two
    tbodies are the only handle the markup gives, and they are enough. */
-#members td:first-child { width: 42%; }
-#members td:nth-child(2) { width: 1%; white-space: nowrap; }
-#members td:last-child { width: 1%; text-align: right; }
+#members tr:not(.m-warn) td:first-child { width: 42%; }
+#members tr:not(.m-warn) td:nth-child(2) { width: 1%; white-space: nowrap; }
+#members tr:not(.m-warn) td:last-child { width: 1%; text-align: right; }
+/* The note belongs to the row above it, so it is tinted with it and ruled off after it. */
+#members tr.m-warn > td { background: var(--warn-t); padding-top: 0; padding-bottom: var(--sp2); }
+#members tr.m-warn + tr > td { border-top: 1px solid var(--hair2); }
 #members .m-email { width: 100%; max-width: 300px; }
 #members label { display: inline-flex; align-items: center; gap: 5px; margin-right: var(--sp2);
                  color: var(--lo2); }
@@ -309,6 +330,19 @@ iframe.html { width: 100%; height: 460px; border: 1px solid var(--hair); border-
 .empty { color: var(--lo); font-size: 12.5px; text-align: center; }
 p.empty { margin: 0; padding: var(--sp6) var(--sp2); }
 .pane .body.empty { padding: var(--sp6) var(--sp4); }
+.warn { color: var(--warn); font-size: 11.5px; line-height: 1.5; display: block; }
+#fwdnotice { margin: 0 0 var(--sp2); }
+#fwdnotice:empty { display: none; }
+/* The one place a mailbox can be removed, kept at the bottom, behind its own rule, and opened
+   rather than fired: the confirm below the button is where the sentence and the typing live. */
+.danger { border-top: 1px solid var(--hair2); margin-top: var(--sp2); padding-top: var(--sp3);
+          padding-bottom: var(--sp1); }
+#delconfirm { border: 1px solid color-mix(in srgb, var(--bad) 40%, var(--hair));
+              background: var(--bad-t); border-radius: var(--rad); padding: var(--sp3);
+              max-width: 760px; }
+#delconfirm[hidden] { display: none; }
+#delwhat { margin: 0 0 var(--sp3); font-size: 12.5px; color: var(--ink); }
+label.dl { font-size: 12px; color: var(--lo2); }
 .err  { color: var(--bad); font-size: 12.5px; }
 .mono { font-family: var(--font-mono); font-size: 12px; }
 #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
