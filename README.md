@@ -8,6 +8,21 @@ for the sub-etha net: one address, everybody listening. From the outside each ma
 like an ordinary mailbox; from the inside it is ~3,500 lines of plain JavaScript and a SQLite
 Durable Object.
 
+![SubEtha — a shared mailbox with its member list, mute rules and message reader](docs/screenshot.png)
+
+## Quick start
+
+```bash
+git clone https://github.com/slartz/subetha && cd subetha
+wrangler r2 bucket create subetha-mail
+wrangler secret put ADMIN_SECRET              # any long random string
+wrangler deploy                               # then: Access app → ACCESS_AUD, OWNERS, ROUTED_DOMAINS → deploy again
+node --test test/*.test.mjs                   # 12 files, no dependencies
+```
+
+Then point an Email Routing rule at the worker and create the mailbox in the UI. The full,
+ordered walkthrough — and why the order matters — is under [Deploy](#deploy).
+
 ## Why this exists
 
 Every other Cloudflare mailbox project is a full webmail — an IMAP-shaped client, a database
