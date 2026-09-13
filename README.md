@@ -104,7 +104,7 @@ use; that is presentation, and every route asks the same question again on the s
 
 Two things on the page are deliberately slower than a click:
 
-* **Deleting a mailbox** is at the bottom of the settings, behind its own button, and the Delete
+* **Deleting a mailbox** is at the very bottom of the page, below the message panes, behind its own button, and the Delete
   is disabled until the address is typed out. The block states what goes — the configuration and
   all N members, forwarding stops immediately — and what stays: the stored messages, their
   archived copies and the mute rules, which all reappear if the address is configured again.
@@ -531,7 +531,7 @@ See `SECURITY.md` for the full threat model.
 node --test test/*.test.mjs
 ```
 
-**175 tests, no dependencies and no test runner to install** — `node:test`, `node:assert` and
+**181 tests, no dependencies and no test runner to install** — `node:test`, `node:assert` and
 nothing else. The suite covers the body parser, the MIME builder, the loop guards, the health
 document, the retention predicate, the R2 key shape, the page's two client-side rules, and the
 structural wall around `compose.js`.

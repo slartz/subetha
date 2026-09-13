@@ -27,7 +27,7 @@ const CSP = (img) => `<meta http-equiv="Content-Security-Policy" content="defaul
 // Two literal colours because a favicon inherits nothing, and percent-encoded because a raw
 // "#" in a data: URI starts a fragment and would cut the document in half. It is deliberately
 // the only icon link on the page — one SVG scales, and a second link is a size negotiation.
-const FAVICON = "%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%235980a6%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Crect%20x%3D%222%22%20y%3D%224%22%20width%3D%2215%22%20height%3D%2211.5%22%20rx%3D%222%22%2F%3E%3Cpath%20d%3D%22M3.5%205.4%209.5%209.9%2015.5%205.4%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke%3D%22%23ffffff%22%20stroke-width%3D%225%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke-width%3D%222.4%22%2F%3E%3C%2Fsvg%3E";
+const FAVICON = "%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23f6821f%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Crect%20x%3D%222%22%20y%3D%224%22%20width%3D%2215%22%20height%3D%2211.5%22%20rx%3D%222%22%2F%3E%3Cpath%20d%3D%22M3.5%205.4%209.5%209.9%2015.5%205.4%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke%3D%22%23ffffff%22%20stroke-width%3D%225%22%2F%3E%3Cpath%20d%3D%22M8%2014.6h13M17.6%2011.2%2021.4%2014.6%2017.6%2018%22%20stroke-width%3D%222.4%22%2F%3E%3C%2Fsvg%3E";
 
 // The two rules on this page worth asserting, kept here as ordinary exported functions and
 // interpolated into the client script below as source. The suite imports them from this module
@@ -48,16 +48,20 @@ export function confirmsDelete(typed, address) {
 // unverified one fails silently for that member while the others still get their copy. Nothing
 // on the page can know whether an address is verified — only a delivery can — so the warning is
 // on until a delivery says otherwise: no status yet, or a failed one, means still unproven.
+//
+// A skip is recorded ok=1 with NOTHING HAVING BEEN SENT — the loop guard declined it, or a rule
+// did — so it proves exactly as little about the address as no row at all. Only a delivery that
+// actually left clears this.
 export function needsForwardWarning(member) {
   if (!member || member.mode !== "forward") return false;
-  return !(member.last && member.last.ok);
+  return !(member.last && member.last.ok && member.last.mode !== "skip");
 }
 
 export function renderUi({ identity } = {}) {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SubEtha</title>
 <link rel="icon" href="data:image/svg+xml,${FAVICON}">
-<meta name="theme-color" content="#5980a6">
+<meta name="theme-color" content="#f6821f">
 <script>
 // The theme is the operator's choice, not the operating system's, and it is read HERE rather
 // than in the script at the foot of the page: by the time that one runs the browser has
@@ -68,79 +72,103 @@ try { if (localStorage.getItem("subetha-theme") === "dark") document.documentEle
 </script>
 <style>${CSS}</style>
 
-<div class="bar">
-  <div class="head">
-    <h1>SubEtha</h1>
-    <span class="grow"></span>
-    <button id="theme" class="icon" aria-label="Toggle dark theme" title="Toggle dark theme"></button>
-    <span class="who" id="who">${esc(identity || "")}</span>
+<div class="page">
+  <div class="bar">
+    <div class="head">
+      <span class="mark" aria-hidden="true"><span></span></span>
+      <div class="brand">
+        <h1>SubEtha</h1>
+        <p class="tag">Email Routing, extended.</p>
+      </div>
+      <span class="grow"></span>
+      <span class="ident">
+        <button id="theme" class="icon" aria-label="Toggle dark theme" title="Toggle dark theme"></button>
+        <span class="sep"></span>
+        <span class="who" id="who">${esc(identity || "")}</span>
+      </span>
+    </div>
+    <div class="row tools">
+      <span class="grp">
+        <label class="lbl" for="box">Mailbox</label>
+        <span class="grp-in">
+          <select id="box"></select>
+          <button id="newbox">New mailbox…</button>
+        </span>
+      </span>
+      <span class="grp grow">
+        <label class="lbl" for="dn">Display name</label>
+        <input type="text" id="dn" placeholder="Support">
+      </span>
+      <span class="grp-in">
+        <button id="save">Save</button>
+        <button id="compose" class="primary">Compose…</button>
+      </span>
+    </div>
+    <div class="mcard">
+      <table class="members">
+        <colgroup><col><col class="c2"><col class="c3"><col class="c4"></colgroup>
+        <thead><tr><th>Member</th><th>Mode</th><th>Last delivery</th><th></th></tr></thead>
+        <tbody id="members"></tbody>
+      </table>
+    </div>
+    <div class="row addrow">
+      <button id="addmember">+ member</button>
+      <span class="note">forward requires a verified destination address on the account;
+        send arrives from the mailbox address and uses the sending quota</span>
+    </div>
+    <div class="warn" id="fwdnotice"></div>
+    <table class="members"><tbody id="rules"></tbody></table>
+    <div class="row"><span class="note" id="rulesnote"></span></div>
+    <div class="row" id="storagerow">
+      <span class="note" id="storage"></span>
+      <span class="grp">
+        <label class="lbl" for="ret">Retention</label>
+        <select id="ret">
+          <option value="">Keep forever</option>
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+          <option value="180">180 days</option>
+          <option value="365">365 days</option>
+        </select>
+        <button id="purge">Delete older than…</button>
+      </span>
+    </div>
+    <div class="err" id="cfgerr"></div>
   </div>
-  <div class="row">
-    <span class="grp">
-      <label class="lbl" for="box">mailbox</label>
-      <select id="box"></select>
-    </span>
-    <button id="newbox" class="primary">New mailbox…</button>
-    <span class="grp grow">
-      <label class="lbl" for="dn">display name</label>
-      <input type="text" id="dn" class="grow" placeholder="Support" style="max-width:260px">
-    </span>
-    <button id="save" class="primary">Save</button>
-    <span class="grow"></span>
-    <button id="compose" class="primary">Compose…</button>
+
+  <div class="panes">
+    <div class="pane">
+      <h2>Messages <span id="count" class="note"></span>
+        <span class="grow"></span>
+        <span class="filters">
+          <label class="opt" title="Show only mail that arrived for a mailbox with no configuration"><input type="checkbox" id="onlyunconf"><span>unconfigured</span></label>
+          <label class="opt" title="Include mail a mute rule hid"><input type="checkbox" id="showmuted"><span>muted</span></label>
+        </span>
+      </h2>
+      <div id="list"></div>
+      <div class="body"><button id="more">Load more</button></div>
+    </div>
+    <div class="pane">
+      <h2 id="msgtitle">Nothing selected</h2>
+      <div class="body" id="msg"><p class="empty">Pick a message on the left.</p></div>
+    </div>
   </div>
-  <table class="members"><tbody id="members"></tbody></table>
-  <div class="row">
-    <button id="addmember">+ member</button>
-    <span class="note">forward requires a verified destination address on the account;
-      send arrives from the mailbox address and uses the sending quota</span>
-  </div>
-  <div class="warn" id="fwdnotice"></div>
-  <table class="members"><tbody id="rules"></tbody></table>
-  <div class="row"><span class="note" id="rulesnote"></span></div>
-  <div class="row" id="storagerow">
-    <span class="note" id="storage"></span>
-    <span class="grow"></span>
-    <label class="lbl" for="ret">retention</label>
-    <select id="ret">
-      <option value="">Keep forever</option>
-      <option value="30">30 days</option>
-      <option value="60">60 days</option>
-      <option value="90">90 days</option>
-      <option value="180">180 days</option>
-      <option value="365">365 days</option>
-    </select>
-    <button id="purge">Delete older than…</button>
-  </div>
+
   <div class="danger" id="dangerzone">
-    <button id="delstart">Delete mailbox…</button>
-    <div id="delconfirm" hidden>
-      <p class="warn" id="delwhat"></p>
-      <div class="row">
+    <div class="dz-l">
+      <h2>Delete this mailbox</h2>
+      <p id="delwhat"></p>
+    </div>
+    <div class="dz-r">
+      <button id="delstart" class="destructive">Delete mailbox…</button>
+      <div id="delconfirm" hidden>
         <label class="dl" for="delconf">Type the address to confirm</label>
-        <input type="text" id="delconf" class="grow" autocomplete="off" autocapitalize="off"
-               spellcheck="false" style="max-width:320px">
+        <input type="text" id="delconf" autocomplete="off" autocapitalize="off" spellcheck="false">
         <button id="del" class="destructive" disabled>Delete</button>
         <button id="delcancel">Cancel</button>
       </div>
     </div>
-  </div>
-  <div class="err" id="cfgerr"></div>
-</div>
-
-<div class="panes">
-  <div class="pane">
-    <h2>Messages <span id="count" class="note"></span>
-      <span class="grow"></span>
-      <label class="opt"><input type="checkbox" id="onlyunconf"> unconfigured only</label>
-      <label class="opt"><input type="checkbox" id="showmuted"> show muted</label>
-    </h2>
-    <div id="list"></div>
-    <div class="body"><button id="more">Load more</button></div>
-  </div>
-  <div class="pane">
-    <h2 id="msgtitle">Nothing selected</h2>
-    <div class="body" id="msg"><p class="empty">Pick a message on the left.</p></div>
   </div>
 </div>
 
@@ -225,8 +253,8 @@ function memberStat(last) {
   if (!last.ok) return '<span class="mstat bad"' + t + ">&#9888; " + esc(last.hint || last.error || "delivery failed") + "</span>";
   // ok with mode 'skip' is the loop guard or a member skip: nothing was sent, and saying
   // "delivered" about a message that was deliberately not sent is the one lie to avoid here.
-  if (last.mode === "skip") return '<span class="mstat"' + t + ">&middot; skipped " + esc(rel(last.at)) + "</span>";
-  return '<span class="mstat ok">&#10003; delivered ' + esc(rel(last.at)) + "</span>";
+  if (last.mode === "skip") return '<span class="mstat skip"' + t + ">skipped " + esc(rel(last.at)) + "</span>";
+  return '<span class="mstat ok">delivered ' + esc(rel(last.at)) + "</span>";
 }
 function memberTint(last) {
   if (!last) return "";
@@ -242,14 +270,19 @@ function memberRow(email, mode, last) {
     return ro;
   }
   // The two radios must share a name to be mutually exclusive, and that name must be unique
-  // to the row or every row in the table becomes one radio group.
+  // to the row or every row in the table becomes one radio group. They are drawn as a segmented
+  // pill — each input laid transparently over its own segment — and they are still radios: the
+  // same name, the same mutual exclusion, the same arrow keys, and readMembers() reads them
+  // exactly as it always did.
   var nm = "mode" + Math.random().toString(36).slice(2);
   var tr = document.createElement("tr");
   tr.className = memberTint(last);
   tr.innerHTML =
     '<td><input type="email" class="m-email" value="' + esc(email || "") + '" placeholder="someone@example.com"></td>' +
-    '<td><label><input type="radio" class="m-fwd" name="' + nm + '"' + (mode !== "send" ? " checked" : "") + '> forward</label> ' +
-    '<label><input type="radio" class="m-snd" name="' + nm + '"' + (mode === "send" ? " checked" : "") + '> send</label></td>' +
+    '<td><span class="modes">' +
+    '<label><input type="radio" class="m-fwd" name="' + nm + '"' + (mode !== "send" ? " checked" : "") + '><span>forward</span></label>' +
+    '<label><input type="radio" class="m-snd" name="' + nm + '"' + (mode === "send" ? " checked" : "") + '><span>send</span></label>' +
+    "</span></td>" +
     "<td>" + memberStat(last) + "</td>" +
     '<td><button class="link m-del">remove</button></td>';
   // The note under a row belongs to it: removing the row removes the note, or the next row
@@ -347,6 +380,10 @@ function closeDelete() {
   el("delstart").hidden = false;
   el("delconf").value = "";
   el("del").disabled = true;
+  // The sentence states a member count for ONE mailbox and the block is at the foot of the page
+  // whether or not the confirm is open, so it goes with the confirm rather than sitting there
+  // describing whatever was selected last.
+  el("delwhat").textContent = "";
 }
 // Deleting mail is the one irreversible thing in SubEtha, so it is two steps and the second one
 // states a number the SERVER counted: the dry run asks what would go, and only what comes back
@@ -419,7 +456,7 @@ async function loadRules() {
   catch (e) { el("rulesnote").textContent = String(e.message || e); return; }
   for (var i = 0; i < rules.length; i++) host.appendChild(ruleRow(rules[i]));
   el("rulesnote").textContent = rules.length
-    ? rules.length + (rules.length === 1 ? " mute rule" : " mute rules") + " — matching mail is stored and readable under “show muted”, and is forwarded to nobody."
+    ? rules.length + (rules.length === 1 ? " mute rule" : " mute rules") + " — matching mail is stored and readable under the “muted” filter, and is forwarded to nobody."
     : RULES_EMPTY;
 }
 // The messages it already muted STAY muted: removing a rule stops it applying from now on,
@@ -479,7 +516,14 @@ function fanoutCell(m) {
   if (!m.fanout_total) return "";
   var bad = m.fanout_total - m.fanout_ok;
   var label = m.direction === "out" ? "sent " : "fan-out ";
-  return '<span class="badge' + (bad ? " bad" : "") + '">' + label + m.fanout_ok + "/" + m.fanout_total + "</span>";
+  return '<span class="st' + (bad ? " bad" : "") + '">' + label + m.fanout_ok + "/" + m.fanout_total + "</span>";
+}
+// The second line of a row: who the message is with, and whether it carries anything. The list
+// payload says only THAT there are attachments — has_attachments is a boolean the DO derives —
+// so this says the same, rather than inventing a count the response does not carry.
+function rowWho(m) {
+  var s = m.direction === "out" ? "to " + (m.to_addrs || "") : (m.from_name || m.from_addr || "");
+  return m.has_attachments ? s + " · attachments" : s;
 }
 function renderList() {
   var only = el("onlyunconf").checked;
@@ -490,16 +534,18 @@ function renderList() {
   if (!shown.length) { host.innerHTML = '<div class="body empty">Nothing here.</div>'; return; }
   for (var i = 0; i < shown.length; i++) {
     (function (m) {
+      var out = m.direction === "out";
       var b = document.createElement("button");
       b.className = "msg" + (sel && sel.id === m.id ? " sel" : "");
       b.innerHTML =
-        '<div class="l1"><span class="badge ' + (m.direction === "out" ? "out" : "in") + '">' + m.direction + "</span>" +
-        '<span class="subj">' + esc(m.subject || "(no subject)") + "</span>" +
+        '<span class="dir' + (out ? " out" : "") + '">' + esc(m.direction) + "</span>" +
+        '<span class="mb">' +
+        '<span class="l1"><span class="subj' + (out ? " out" : "") + '">' + esc(m.subject || "(no subject)") + "</span>" +
+        '<span class="when">' + esc(when(m.received_at, m.date_hdr)) + "</span></span>" +
+        '<span class="l2"><span class="who2">' + esc(rowWho(m)) + "</span>" +
         (m.unconfigured ? '<span class="badge unconf">unconfigured</span>' : "") +
-        (m.hidden ? '<span class="badge muted">muted' + (m.muted_by ? " &middot; rule #" + m.muted_by : "") + "</span>" : "") + "</div>" +
-        '<div class="l2"><span class="grow">' + esc(m.direction === "out" ? "to " + (m.to_addrs || "") : (m.from_name || m.from_addr || "")) + "</span>" +
-        (m.has_attachments ? '<span class="badge">att</span>' : "") + fanoutCell(m) +
-        '<span class="when">' + esc(when(m.received_at, m.date_hdr)) + "</span></div>";
+        (m.hidden ? '<span class="badge muted">muted' + (m.muted_by ? " &middot; rule #" + m.muted_by : "") + "</span>" : "") +
+        fanoutCell(m) + "</span></span>";
       b.onclick = function () { openMsg(m.id).catch(function (e) { toast(String(e.message || e)); }); };
       host.appendChild(b);
     })(shown[i]);
@@ -518,7 +564,10 @@ async function loadMessages(reset) {
 }
 
 // ---- one message -------------------------------------------------------
-function kv(k, v) { return v ? '<tr><td class="k">' + esc(k) + "</td><td>" + esc(v) + "</td></tr>" : ""; }
+function kv(k, v, cls) {
+  return v ? '<tr><td class="k">' + esc(k) + "</td><td" + (cls ? ' class="' + cls + '"' : "") + ">" +
+             esc(v) + "</td></tr>" : "";
+}
 // The rule that muted this message may have been removed since — the row keeps its id either
 // way, so say which of the two this is rather than showing a dangling number.
 function mutedNote(m) {
@@ -529,13 +578,13 @@ function mutedNote(m) {
 }
 function fanoutTable(f) {
   if (!f || !f.length) return "";
-  var s = '<h3 class="sec">Fan-out</h3><table class="kv">';
+  var s = '<h3 class="sec fan">Fan-out</h3><div class="fanout">';
   for (var i = 0; i < f.length; i++) {
-    s += '<tr><td class="k">' + esc(f[i].member || "—") + "</td><td>" +
-         '<span class="badge' + (f[i].ok ? "" : " bad") + '">' + esc(f[i].mode) + (f[i].ok ? " ok" : " FAILED") + "</span> " +
-         esc(f[i].error || "") + "</td></tr>";
+    s += '<div><span class="fm">' + esc(f[i].member || "—") + "</span>" +
+         '<span class="fs' + (f[i].ok ? "" : " bad") + '">' + esc(f[i].mode) + (f[i].ok ? " ok" : " FAILED") +
+         (f[i].error ? " &middot; " + esc(f[i].error) : "") + "</span></div>";
   }
-  return s + "</table>";
+  return s + "</div>";
 }
 async function openMsg(id) {
   sel = await api("/api/messages/" + id);
@@ -556,16 +605,21 @@ function render() {
   el("msgtitle").textContent = m.subject || "(no subject)";
   var atts = [];
   try { atts = JSON.parse(m.attachments_json || "[]") || []; } catch (e) { atts = []; }
-  var attHtml = "";
+  // One row of chips rather than one row per file: the names are what an operator scans and the
+  // sizes are what decides whether to download. The media type goes on the chip's title — it is
+  // rarely the question, and it doubles the width of the line when it is not.
+  var chips = "";
   for (var i = 0; i < atts.length; i++) {
-    attHtml += '<tr><td class="k">attachment</td><td>' + esc(atts[i].filename || atts[i].note || "(unnamed)") +
-               ' <span class="note">' + esc(atts[i].type || "") + " " + (atts[i].size || 0) + " bytes</span></td></tr>";
+    chips += '<span class="chip"' + (atts[i].type ? ' title="' + esc(atts[i].type) + '"' : "") + ">" +
+             esc(atts[i].filename || atts[i].note || "(unnamed)") +
+             ' <span class="note">' + esc(size(atts[i].size || 0)) + "</span></span>";
   }
+  var attHtml = chips ? '<tr><td class="k">attachments</td><td>' + chips + "</td></tr>" : "";
   var head = "<table class='kv'>" +
     kv("direction", m.direction === "out" ? "outgoing" + (m.sent_by ? " — sent by " + m.sent_by : "") : "incoming") +
     kv("from", (m.from_name ? m.from_name + " " : "") + "<" + (m.from_addr || "") + ">") +
     kv("reply-to", m.reply_to) + kv("to", m.to_addrs) + kv("cc", m.cc_addrs) +
-    kv("date", when(m.received_at, m.date_hdr)) + kv("message-id", m.message_id) +
+    kv("date", when(m.received_at, m.date_hdr)) + kv("message-id", m.message_id, "mono ell") +
     kv("in-reply-to", m.in_reply_to) + kv("size", m.size ? m.size + " bytes" : "") +
     (m.unconfigured ? '<tr><td class="k">state</td><td><span class="badge unconf">arrived for a mailbox with no configuration — nothing was forwarded</span></td></tr>' : "") +
     (m.hidden ? '<tr><td class="k">state</td><td><span class="badge muted">muted' + (m.muted_by ? " &middot; rule #" + m.muted_by : " by hand") +
@@ -576,7 +630,7 @@ function render() {
   // which would come straight back through Email Routing and be fanned out again.
   var n = m.remote_images || 0;
   var buttons = '<div class="row actions">' +
-    (m.direction === "out" ? "" : '<button id="breply">Reply</button>') +
+    (m.direction === "out" ? "" : '<button id="breply" class="primary">Reply</button>') +
     (m.html ? '<button id="bhtml">' + (showHtml ? "Show text" : "Show HTML") + "</button>" : "") +
     (showHtml && !loadRemote && n ? '<button id="bremote">Load ' + n + " remote image" + (n === 1 ? "" : "s") + "</button>" : "") +
     (m.r2_key ? '<a href="/api/messages/' + m.id + '/raw"><button>Download raw</button></a>' : "") +
@@ -587,7 +641,7 @@ function render() {
     (isOwner && m.hidden ? '<button id="bunhide">Unhide</button>' : "") +
     "</div>";
 
-  el("msg").innerHTML = head + buttons +
+  el("msg").innerHTML = buttons + head +
     (showHtml && m.render_note ? '<div class="note">' + esc(m.render_note) + "</div>" : "") +
     (showHtml ? '<iframe class="html" id="frame"></iframe>' : '<pre class="text">' + esc(m.text || "(no text body)") + "</pre>") +
     fanoutTable(m.fanout) +

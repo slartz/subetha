@@ -10,7 +10,7 @@ From the project root, with any Node that has `node:test` (18+). **No dependenci
 to install** — `node:test`, `node:assert/strict`, `node:fs`, `node:path`, `node:url` and
 nothing else. There is no test runner, no config file, and no build step.
 
-Expected: **175 tests, 175 pass, 0 fail.**
+Expected: **181 tests, 181 pass, 0 fail.**
 
 Run one file while working on it:
 
@@ -46,10 +46,9 @@ disabled attribute and never reaches a `window.confirm`, and that the delete but
 the block `applyRole()` hides from a member.
 
 One of these encodes a decision rather than a fact. A `skip` is recorded in `fanout_log` as
-`ok=1` although nothing was sent, so by the rule as written — `last.ok`, and nothing finer — a
-member whose only fan-out row is a skip stops being warned about without any delivery having
-proved the address. `DESIGN.md` is explicit that a skip is not drawn as "delivered" elsewhere on
-the row, so the two readings are worth reconciling; the test says plainly which one is in force.
+`ok=1` although nothing was sent, so the rule is `last.ok && last.mode !== "skip"`: only a real
+delivery clears the warning, and a member whose only fan-out row is a skip keeps it. This matches
+the member row, which never draws a skip as "delivered". The test names the decision.
 
 **`build-mime.test.mjs`** — two of these are security tests and the rest correctness. Header
 injection through the Subject and through the display name is neutralised; an invalid address

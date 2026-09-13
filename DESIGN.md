@@ -716,9 +716,9 @@ so the rule the suite asserts is the text the browser runs rather than a second 
   if the address is configured again. That sentence, with the member count in it, is the reason
   the block exists; the typing is the smaller half.
 * **`needsForwardWarning` stays on until a delivery says otherwise.** Nothing on the page can
-  know whether an address is a verified destination — only a delivery can — so `last.ok` is the
-  whole rule, including for a `skip`, which is recorded `ok=1` with nothing having been sent.
-  See the note in `TESTS.md`.
+  know whether an address is a verified destination — only a delivery can — so the rule is
+  `last.ok && last.mode !== "skip"`: a `skip` is recorded `ok=1` with nothing sent and does not
+  count as proof. See the note in `TESTS.md`.
 
 ## R2 key shape
 

@@ -55,7 +55,7 @@ false, the tests fail, and that is the tests working.
 node --test test/*.test.mjs
 ```
 
-**Must be 159/159 before you open a PR**, and a PR that changes behaviour adds tests. See
+**Must be 181/181 before you open a PR**, and a PR that changes behaviour adds tests. See
 `TESTS.md` for what each file covers and what is deliberately not covered.
 
 Note that `test/build-mime.test.mjs` contains a literal NUL byte in one fixture — it is meant
